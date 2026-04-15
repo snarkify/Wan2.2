@@ -20,6 +20,7 @@ from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
 from .modules.model import WanModel
+from .profiling import profiled_loop
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
 from .utils.fm_solvers import (
@@ -379,38 +380,46 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = [latent.to(self.device)]
-                timestep = [t]
+            with profiled_loop() as loop:
+              for step_idx, t in enumerate(tqdm(timesteps)):
+                with loop.step(step_idx) as spans:
+                    latent_model_input = [latent.to(self.device)]
+                    timestep = [t]
 
-                timestep = torch.stack(timestep).to(self.device)
+                    timestep = torch.stack(timestep).to(self.device)
 
-                model = self._prepare_model_for_timestep(
-                    t, boundary, offload_model)
-                sample_guide_scale = guide_scale[1] if t.item(
-                ) >= boundary else guide_scale[0]
+                    with spans.span("model_prepare"):
+                        model = self._prepare_model_for_timestep(
+                            t, boundary, offload_model)
+                    sample_guide_scale = guide_scale[1] if t.item(
+                    ) >= boundary else guide_scale[0]
 
-                noise_pred_cond = model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred_uncond = model(
-                    latent_model_input, t=timestep, **arg_null)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred = noise_pred_uncond + sample_guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                    with spans.span("model_forward_cond"):
+                        noise_pred_cond = model(
+                            latent_model_input, t=timestep, **arg_c)[0]
+                    if offload_model:
+                        torch.cuda.empty_cache()
+                    with spans.span("model_forward_uncond"):
+                        noise_pred_uncond = model(
+                            latent_model_input, t=timestep, **arg_null)[0]
+                    if offload_model:
+                        torch.cuda.empty_cache()
 
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latent.unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g)[0]
-                latent = temp_x0.squeeze(0)
+                    with spans.span("guidance_merge"):
+                        noise_pred = noise_pred_uncond + sample_guide_scale * (
+                            noise_pred_cond - noise_pred_uncond)
 
-                x0 = [latent]
-                del latent_model_input, timestep
+                    with spans.span("scheduler_step"):
+                        temp_x0 = sample_scheduler.step(
+                            noise_pred.unsqueeze(0),
+                            t,
+                            latent.unsqueeze(0),
+                            return_dict=False,
+                            generator=seed_g)[0]
+                    latent = temp_x0.squeeze(0)
+
+                    x0 = [latent]
+                    del latent_model_input, timestep
 
             if offload_model:
                 self.low_noise_model.cpu()

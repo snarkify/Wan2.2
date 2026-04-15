@@ -20,6 +20,7 @@ from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
 from .modules.model import WanModel
+from .profiling import profiled_loop
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
 from .utils.fm_solvers import (
@@ -364,34 +365,40 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = latents
-                timestep = [t]
+            with profiled_loop() as loop:
+              for step_idx, t in enumerate(tqdm(timesteps)):
+                with loop.step(step_idx) as spans:
+                    latent_model_input = latents
+                    timestep = [t]
 
-                timestep = torch.stack(timestep)
+                    timestep = torch.stack(timestep)
 
-                temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
-                temp_ts = torch.cat([
-                    temp_ts,
-                    temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
-                ])
-                timestep = temp_ts.unsqueeze(0)
+                    temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
+                    temp_ts = torch.cat([
+                        temp_ts,
+                        temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
+                    ])
+                    timestep = temp_ts.unsqueeze(0)
 
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                    with spans.span("model_forward_cond"):
+                        noise_pred_cond = self.model(
+                            latent_model_input, t=timestep, **arg_c)[0]
+                    with spans.span("model_forward_uncond"):
+                        noise_pred_uncond = self.model(
+                            latent_model_input, t=timestep, **arg_null)[0]
 
-                noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                    with spans.span("guidance_merge"):
+                        noise_pred = noise_pred_uncond + guide_scale * (
+                            noise_pred_cond - noise_pred_uncond)
 
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latents[0].unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g)[0]
-                latents = [temp_x0.squeeze(0)]
+                    with spans.span("scheduler_step"):
+                        temp_x0 = sample_scheduler.step(
+                            noise_pred.unsqueeze(0),
+                            t,
+                            latents[0].unsqueeze(0),
+                            return_dict=False,
+                            generator=seed_g)[0]
+                    latents = [temp_x0.squeeze(0)]
             x0 = latents
             if offload_model:
                 self.model.cpu()
@@ -564,41 +571,48 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = [latent.to(self.device)]
-                timestep = [t]
+            with profiled_loop() as loop:
+              for step_idx, t in enumerate(tqdm(timesteps)):
+                with loop.step(step_idx) as spans:
+                    latent_model_input = [latent.to(self.device)]
+                    timestep = [t]
 
-                timestep = torch.stack(timestep).to(self.device)
+                    timestep = torch.stack(timestep).to(self.device)
 
-                temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
-                temp_ts = torch.cat([
-                    temp_ts,
-                    temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
-                ])
-                timestep = temp_ts.unsqueeze(0)
+                    temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
+                    temp_ts = torch.cat([
+                        temp_ts,
+                        temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
+                    ])
+                    timestep = temp_ts.unsqueeze(0)
 
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                    with spans.span("model_forward_cond"):
+                        noise_pred_cond = self.model(
+                            latent_model_input, t=timestep, **arg_c)[0]
+                    if offload_model:
+                        torch.cuda.empty_cache()
+                    with spans.span("model_forward_uncond"):
+                        noise_pred_uncond = self.model(
+                            latent_model_input, t=timestep, **arg_null)[0]
+                    if offload_model:
+                        torch.cuda.empty_cache()
 
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latent.unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g)[0]
-                latent = temp_x0.squeeze(0)
-                latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+                    with spans.span("guidance_merge"):
+                        noise_pred = noise_pred_uncond + guide_scale * (
+                            noise_pred_cond - noise_pred_uncond)
 
-                x0 = [latent]
-                del latent_model_input, timestep
+                    with spans.span("scheduler_step"):
+                        temp_x0 = sample_scheduler.step(
+                            noise_pred.unsqueeze(0),
+                            t,
+                            latent.unsqueeze(0),
+                            return_dict=False,
+                            generator=seed_g)[0]
+                    latent = temp_x0.squeeze(0)
+                    latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+
+                    x0 = [latent]
+                    del latent_model_input, timestep
 
             if offload_model:
                 self.model.cpu()

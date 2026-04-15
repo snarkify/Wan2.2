@@ -24,6 +24,7 @@ from tqdm import tqdm
 from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
+from .profiling import profiled_loop, trace_span
 from .modules.s2v.audio_encoder import AudioEncoder
 from .modules.s2v.model_s2v import WanModel_S2V, sp_attn_forward_s2v
 from .modules.t5 import T5EncoderModel
@@ -538,6 +539,7 @@ class WanS2V:
                 torch.no_grad(),
         ):
             for r in range(num_repeat):
+              with trace_span("clip", step=r):
                 seed_g = torch.Generator(device=self.device)
                 seed_g.manual_seed(seed + r)
 
@@ -614,31 +616,38 @@ class WanS2V:
                     self.noise_model.to(self.device)
                     torch.cuda.empty_cache()
 
-                for i, t in enumerate(tqdm(timesteps)):
+                with profiled_loop() as loop:
+                 for i, t in enumerate(tqdm(timesteps)):
+                  with loop.step(i) as spans:
                     latent_model_input = latents[0:1]
                     timestep = [t]
 
                     timestep = torch.stack(timestep).to(self.device)
 
-                    noise_pred_cond = self.noise_model(
-                        latent_model_input, t=timestep, **arg_c)
+                    with spans.span("model_forward_cond"):
+                        noise_pred_cond = self.noise_model(
+                            latent_model_input, t=timestep, **arg_c)
 
                     if guide_scale > 1:
-                        noise_pred_uncond = self.noise_model(
-                            latent_model_input, t=timestep, **arg_null)
-                        noise_pred = [
-                            u + guide_scale * (c - u)
-                            for c, u in zip(noise_pred_cond, noise_pred_uncond)
-                        ]
+                        with spans.span("model_forward_uncond"):
+                            noise_pred_uncond = self.noise_model(
+                                latent_model_input, t=timestep, **arg_null)
+                        with spans.span("guidance_merge"):
+                            noise_pred = [
+                                u + guide_scale * (c - u)
+                                for c, u in zip(noise_pred_cond,
+                                                noise_pred_uncond)
+                            ]
                     else:
                         noise_pred = noise_pred_cond
 
-                    temp_x0 = sample_scheduler.step(
-                        noise_pred[0].unsqueeze(0),
-                        t,
-                        latents[0].unsqueeze(0),
-                        return_dict=False,
-                        generator=seed_g)[0]
+                    with spans.span("scheduler_step"):
+                        temp_x0 = sample_scheduler.step(
+                            noise_pred[0].unsqueeze(0),
+                            t,
+                            latents[0].unsqueeze(0),
+                            return_dict=False,
+                            generator=seed_g)[0]
                     latents[0] = temp_x0.squeeze(0)
 
                 if offload_model:

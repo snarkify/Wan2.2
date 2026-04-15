@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -7,6 +8,8 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention
+from ..profiling import trace_span
+from ..profiling._config import get_config
 
 __all__ = ['WanModel']
 
@@ -444,38 +447,46 @@ class WanModel(ModelMixin, ConfigMixin):
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
+        _detail = get_config().model_detail
+
         # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
-        x = torch.cat([
-            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
-                      dim=1) for u in x
-        ])
+        with trace_span("patch_embedding") if _detail else nullcontext():
+            x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+            grid_sizes = torch.stack(
+                [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+            x = [u.flatten(2).transpose(1, 2) for u in x]
+            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+            assert seq_lens.max() <= seq_len
+            x = torch.cat([
+                torch.cat(
+                    [u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                    dim=1) for u in x
+            ])
 
         # time embeddings
-        if t.dim() == 1:
-            t = t.expand(t.size(0), seq_len)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
-            bt = t.size(0)
-            t = t.flatten()
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim,
-                                        t).unflatten(0, (bt, seq_len)).float())
-            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        with trace_span("time_embedding") if _detail else nullcontext():
+            if t.dim() == 1:
+                t = t.expand(t.size(0), seq_len)
+            with torch.amp.autocast('cuda', dtype=torch.float32):
+                bt = t.size(0)
+                t = t.flatten()
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(
+                        self.freq_dim,
+                        t).unflatten(0, (bt, seq_len)).float())
+                e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+                assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
-        context_lens = None
-        context = self.text_embedding(
-            torch.stack([
-                torch.cat(
-                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                for u in context
-            ]))
+        with trace_span("text_embedding") if _detail else nullcontext():
+            context_lens = None
+            context = self.text_embedding(
+                torch.stack([
+                    torch.cat(
+                        [u, u.new_zeros(
+                            self.text_len - u.size(0), u.size(1))])
+                    for u in context
+                ]))
 
         # arguments
         kwargs = dict(
@@ -486,14 +497,17 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens)
 
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        for i, block in enumerate(self.blocks):
+            with trace_span(f"block_{i}") if _detail else nullcontext():
+                x = block(x, **kwargs)
 
         # head
-        x = self.head(x, e)
+        with trace_span("head") if _detail else nullcontext():
+            x = self.head(x, e)
 
         # unpatchify
-        x = self.unpatchify(x, grid_sizes)
+        with trace_span("unpatchify") if _detail else nullcontext():
+            x = self.unpatchify(x, grid_sizes)
         return [u.float() for u in x]
 
     def unpatchify(self, x, grid_sizes):

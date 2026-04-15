@@ -18,6 +18,13 @@ import wan
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.distributed.util import init_distributed_group
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
+from wan.profiling import (
+    flush as profiling_flush,
+    init_from_args as profiling_init,
+    record_memory,
+    setup_profiling,
+    trace_span,
+)
 from wan.utils.utils import merge_video_audio, save_video, str2bool
 
 
@@ -294,6 +301,11 @@ def _parse_args():
         default=80,
         help="Number of frames per clip, 48 or 80 or others (must be multiple of 4) for 14B s2v"
     )
+    parser.add_argument(
+        "--profile_dir",
+        type=str,
+        default=None,
+        help="Enable profiling. Output directory for timing CSVs and traces.")
     args = parser.parse_args()
     _validate_args(args)
 
@@ -341,6 +353,9 @@ def generate(args):
     if args.ulysses_size > 1:
         assert args.ulysses_size == world_size, f"The number of ulysses_size should be equal to the world size."
         init_distributed_group()
+
+    # Initialize profiling (after dist.init so RANK is available)
+    profiling_init(args.profile_dir)
 
     if args.use_prompt_extend:
         if args.prompt_extend_method == "dashscope":
@@ -414,17 +429,21 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
         )
 
+        setup_profiling(wan_t2v)
         logging.info(f"Generating video ...")
-        video = wan_t2v.generate(
-            args.prompt,
-            size=SIZE_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+        record_memory("pipeline_init")
+        with trace_span("pipeline_generate"):
+            video = wan_t2v.generate(
+                args.prompt,
+                size=SIZE_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+        record_memory("pipeline_end")
     elif "ti2v" in args.task:
         logging.info("Creating WanTI2V pipeline.")
         wan_ti2v = wan.WanTI2V(
@@ -439,19 +458,23 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
         )
 
+        setup_profiling(wan_ti2v)
         logging.info(f"Generating video ...")
-        video = wan_ti2v.generate(
-            args.prompt,
-            img=img,
-            size=SIZE_CONFIGS[args.size],
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+        record_memory("pipeline_init")
+        with trace_span("pipeline_generate"):
+            video = wan_ti2v.generate(
+                args.prompt,
+                img=img,
+                size=SIZE_CONFIGS[args.size],
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+        record_memory("pipeline_end")
     elif "animate" in args.task:
         logging.info("Creating Wan-Animate pipeline.")
         wan_animate = wan.WanAnimate(
@@ -467,18 +490,22 @@ def generate(args):
             use_relighting_lora=args.use_relighting_lora
         )
 
+        setup_profiling(wan_animate)
         logging.info(f"Generating video ...")
-        video = wan_animate.generate(
-            src_root_path=args.src_root_path,
-            replace_flag=args.replace_flag,
-            refert_num = args.refert_num,
-            clip_len=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+        record_memory("pipeline_init")
+        with trace_span("pipeline_generate"):
+            video = wan_animate.generate(
+                src_root_path=args.src_root_path,
+                replace_flag=args.replace_flag,
+                refert_num = args.refert_num,
+                clip_len=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+        record_memory("pipeline_end")
     elif "s2v" in args.task:
         logging.info("Creating WanS2V pipeline.")
         wan_s2v = wan.WanS2V(
@@ -492,27 +519,31 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
+        setup_profiling(wan_s2v)
         logging.info(f"Generating video ...")
-        video = wan_s2v.generate(
-            input_prompt=args.prompt,
-            ref_image_path=args.image,
-            audio_path=args.audio,
-            enable_tts=args.enable_tts,
-            tts_prompt_audio=args.tts_prompt_audio,
-            tts_prompt_text=args.tts_prompt_text,
-            tts_text=args.tts_text,
-            num_repeat=args.num_clip,
-            pose_video=args.pose_video,
-            max_area=MAX_AREA_CONFIGS[args.size],
-            infer_frames=args.infer_frames,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model,
-            init_first_frame=args.start_from_ref,
-        )
+        record_memory("pipeline_init")
+        with trace_span("pipeline_generate"):
+            video = wan_s2v.generate(
+                input_prompt=args.prompt,
+                ref_image_path=args.image,
+                audio_path=args.audio,
+                enable_tts=args.enable_tts,
+                tts_prompt_audio=args.tts_prompt_audio,
+                tts_prompt_text=args.tts_prompt_text,
+                tts_text=args.tts_text,
+                num_repeat=args.num_clip,
+                pose_video=args.pose_video,
+                max_area=MAX_AREA_CONFIGS[args.size],
+                infer_frames=args.infer_frames,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model,
+                init_first_frame=args.start_from_ref,
+            )
+        record_memory("pipeline_end")
     else:
         logging.info("Creating WanI2V pipeline.")
         wan_i2v = wan.WanI2V(
@@ -526,18 +557,22 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
+        setup_profiling(wan_i2v)
         logging.info("Generating video ...")
-        video = wan_i2v.generate(
-            args.prompt,
-            img,
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+        record_memory("pipeline_init")
+        with trace_span("pipeline_generate"):
+            video = wan_i2v.generate(
+                args.prompt,
+                img,
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+        record_memory("pipeline_end")
 
     if rank == 0:
         if args.save_file is None:
@@ -562,6 +597,7 @@ def generate(args):
                 merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
     del video
 
+    profiling_flush()
     torch.cuda.synchronize()
     if dist.is_initialized():
         dist.barrier()

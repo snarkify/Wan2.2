@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
+from .profiling import profiled_loop, trace_span
 
 from .modules.animate import WanAnimateModel
 from .modules.animate import CLIPModel
@@ -394,9 +395,12 @@ class WanAnimate:
         start = 0
         end = clip_len
         all_out_frames = []
+        clip_idx = 0
         while True:
             if start + refert_num >= len(cond_images):
                 break
+            _clip_span = trace_span("clip", step=clip_idx)
+            _clip_span.__enter__()
 
             if start == 0:
                 mask_reft_len = 0
@@ -600,35 +604,41 @@ class WanAnimate:
                         "face_pixel_values": face_pixel_values_uncond,
                     }
 
-                for i, t in enumerate(tqdm(timesteps)):
+                with profiled_loop() as loop:
+                 for i, t in enumerate(tqdm(timesteps)):
+                  with loop.step(i) as spans:
                     latent_model_input = latents
                     timestep = [t]
 
                     timestep = torch.stack(timestep)
 
-                    noise_pred_cond = TensorList(
-                         self.noise_model(TensorList(latent_model_input), t=timestep, **arg_c)
-                    )
+                    with spans.span("model_forward_cond"):
+                        noise_pred_cond = TensorList(
+                             self.noise_model(TensorList(latent_model_input), t=timestep, **arg_c)
+                        )
 
                     if guide_scale > 1:
-                        noise_pred_uncond = TensorList(
-                             self.noise_model(
-                                TensorList(latent_model_input), t=timestep, **arg_null
+                        with spans.span("model_forward_uncond"):
+                            noise_pred_uncond = TensorList(
+                                 self.noise_model(
+                                    TensorList(latent_model_input), t=timestep, **arg_null
+                                )
                             )
-                        )
-                        noise_pred = noise_pred_uncond + guide_scale * (
-                            noise_pred_cond - noise_pred_uncond
-                        )
+                        with spans.span("guidance_merge"):
+                            noise_pred = noise_pred_uncond + guide_scale * (
+                                noise_pred_cond - noise_pred_uncond
+                            )
                     else:
                         noise_pred = noise_pred_cond
 
-                    temp_x0 = sample_scheduler.step(
-                        noise_pred[0].unsqueeze(0),
-                        t,
-                        latents[0].unsqueeze(0),
-                        return_dict=False,
-                        generator=seed_g,
-                    )[0]
+                    with spans.span("scheduler_step"):
+                        temp_x0 = sample_scheduler.step(
+                            noise_pred[0].unsqueeze(0),
+                            t,
+                            latents[0].unsqueeze(0),
+                            return_dict=False,
+                            generator=seed_g,
+                        )[0]
                     latents[0] = temp_x0.squeeze(0)
 
                     x0 = latents
@@ -643,6 +653,9 @@ class WanAnimate:
 
                 start += clip_len - refert_num
                 end += clip_len - refert_num
+
+            _clip_span.__exit__(None, None, None)
+            clip_idx += 1
 
         videos = torch.cat(all_out_frames, dim=2)[:, :, :real_frame_len]
         return videos[0] if self.rank == 0 else None
