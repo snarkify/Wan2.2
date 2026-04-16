@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import gc
 import logging
 import math
 import os
@@ -91,47 +92,53 @@ class WanAnimate:
             self.init_on_cpu = False
 
         shard_fn = partial(shard_model, device_id=device_id)
-        self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None,
-        )
+        with trace_span("load_t5"):
+            self.text_encoder = T5EncoderModel(
+                text_len=config.text_len,
+                dtype=config.t5_dtype,
+                device=torch.device('cpu'),
+                checkpoint_path=os.path.join(checkpoint_dir,
+                                             config.t5_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir,
+                                            config.t5_tokenizer),
+                shard_fn=shard_fn if t5_fsdp else None,
+            )
 
-        self.clip = CLIPModel(
-            dtype=torch.float16,
-            device=self.device,
-            checkpoint_path=os.path.join(checkpoint_dir,
-                                         config.clip_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
+        with trace_span("load_clip"):
+            self.clip = CLIPModel(
+                dtype=torch.float16,
+                device=self.device,
+                checkpoint_path=os.path.join(checkpoint_dir,
+                                             config.clip_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir,
+                                            config.clip_tokenizer))
 
-        self.vae = Wan2_1_VAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+        with trace_span("load_vae"):
+            self.vae = Wan2_1_VAE(
+                vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+                device=self.device)
 
         logging.info(f"Creating WanAnimate from {checkpoint_dir}")
+        with trace_span("load_dit"):
+            if not dit_fsdp:
+                self.noise_model = WanAnimateModel.from_pretrained(
+                    checkpoint_dir,
+                    torch_dtype=self.param_dtype,
+                    device_map=self.device)
+            else:
+                self.noise_model = WanAnimateModel.from_pretrained(
+                    checkpoint_dir, torch_dtype=self.param_dtype)
 
-        if not dit_fsdp:
-            self.noise_model = WanAnimateModel.from_pretrained(
-                checkpoint_dir,
-                torch_dtype=self.param_dtype,
-                device_map=self.device)
-        else:
-            self.noise_model = WanAnimateModel.from_pretrained(
-                checkpoint_dir, torch_dtype=self.param_dtype)
-
-        self.noise_model = self._configure_model(
-            model=self.noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype,
-            use_lora=use_relighting_lora,
-            checkpoint_dir=checkpoint_dir,
-            config=config
-            )
+            self.noise_model = self._configure_model(
+                model=self.noise_model,
+                use_sp=use_sp,
+                dit_fsdp=dit_fsdp,
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype,
+                use_lora=use_relighting_lora,
+                checkpoint_dir=checkpoint_dir,
+                config=config
+                )
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -367,11 +374,15 @@ class WanAnimate:
         cond_images, face_images, refer_images = self.prepare_source(src_pose_path=src_pose_path, src_face_path=src_face_path, src_ref_path=src_ref_path)
         
         if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
+            with trace_span("t5_to_gpu"):
+                self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt], self.device)
             if offload_model:
-                self.text_encoder.model.cpu()
+                with trace_span("t5_free"):
+                    del self.text_encoder
+                    gc.collect()
+                    torch.cuda.empty_cache()
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))

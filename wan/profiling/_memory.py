@@ -28,9 +28,8 @@ def record_memory_snapshot(label, stopwatch, tracer, config):
         "max_memory_allocated_mb": round(peak, 1),
     }
 
-    if tracer is not None:
-        name = f"gpu_memory/{label}" if label else "gpu_memory"
-        tracer.counter(name, values)
+    # Memory counters disabled in trace (not readable in Perfetto).
+    # Still recorded in CSV via stopwatch below.
 
     if stopwatch is not None:
         name = f"memory/{label}" if label else "memory"

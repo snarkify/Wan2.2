@@ -417,17 +417,18 @@ def generate(args):
 
     if "t2v" in args.task:
         logging.info("Creating WanT2V pipeline.")
-        wan_t2v = wan.WanT2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-        )
+        with trace_span("pipeline_init"):
+            wan_t2v = wan.WanT2V(
+                config=cfg,
+                checkpoint_dir=args.ckpt_dir,
+                device_id=device,
+                rank=rank,
+                t5_fsdp=args.t5_fsdp,
+                dit_fsdp=args.dit_fsdp,
+                use_sp=(args.ulysses_size > 1),
+                t5_cpu=args.t5_cpu,
+                convert_model_dtype=args.convert_model_dtype,
+            )
 
         setup_profiling(wan_t2v)
         logging.info(f"Generating video ...")
@@ -446,17 +447,18 @@ def generate(args):
         record_memory("pipeline_end")
     elif "ti2v" in args.task:
         logging.info("Creating WanTI2V pipeline.")
-        wan_ti2v = wan.WanTI2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-        )
+        with trace_span("pipeline_init"):
+            wan_ti2v = wan.WanTI2V(
+                config=cfg,
+                checkpoint_dir=args.ckpt_dir,
+                device_id=device,
+                rank=rank,
+                t5_fsdp=args.t5_fsdp,
+                dit_fsdp=args.dit_fsdp,
+                use_sp=(args.ulysses_size > 1),
+                t5_cpu=args.t5_cpu,
+                convert_model_dtype=args.convert_model_dtype,
+            )
 
         setup_profiling(wan_ti2v)
         logging.info(f"Generating video ...")
@@ -477,18 +479,19 @@ def generate(args):
         record_memory("pipeline_end")
     elif "animate" in args.task:
         logging.info("Creating Wan-Animate pipeline.")
-        wan_animate = wan.WanAnimate(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-            use_relighting_lora=args.use_relighting_lora
-        )
+        with trace_span("pipeline_init"):
+            wan_animate = wan.WanAnimate(
+                config=cfg,
+                checkpoint_dir=args.ckpt_dir,
+                device_id=device,
+                rank=rank,
+                t5_fsdp=args.t5_fsdp,
+                dit_fsdp=args.dit_fsdp,
+                use_sp=(args.ulysses_size > 1),
+                t5_cpu=args.t5_cpu,
+                convert_model_dtype=args.convert_model_dtype,
+                use_relighting_lora=args.use_relighting_lora
+            )
 
         setup_profiling(wan_animate)
         logging.info(f"Generating video ...")
@@ -508,17 +511,18 @@ def generate(args):
         record_memory("pipeline_end")
     elif "s2v" in args.task:
         logging.info("Creating WanS2V pipeline.")
-        wan_s2v = wan.WanS2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-        )
+        with trace_span("pipeline_init"):
+            wan_s2v = wan.WanS2V(
+                config=cfg,
+                checkpoint_dir=args.ckpt_dir,
+                device_id=device,
+                rank=rank,
+                t5_fsdp=args.t5_fsdp,
+                dit_fsdp=args.dit_fsdp,
+                use_sp=(args.ulysses_size > 1),
+                t5_cpu=args.t5_cpu,
+                convert_model_dtype=args.convert_model_dtype,
+            )
         setup_profiling(wan_s2v)
         logging.info(f"Generating video ...")
         record_memory("pipeline_init")
@@ -546,17 +550,18 @@ def generate(args):
         record_memory("pipeline_end")
     else:
         logging.info("Creating WanI2V pipeline.")
-        wan_i2v = wan.WanI2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-        )
+        with trace_span("pipeline_init"):
+            wan_i2v = wan.WanI2V(
+                config=cfg,
+                checkpoint_dir=args.ckpt_dir,
+                device_id=device,
+                rank=rank,
+                t5_fsdp=args.t5_fsdp,
+                dit_fsdp=args.dit_fsdp,
+                use_sp=(args.ulysses_size > 1),
+                t5_cpu=args.t5_cpu,
+                convert_model_dtype=args.convert_model_dtype,
+            )
         setup_profiling(wan_i2v)
         logging.info("Generating video ...")
         record_memory("pipeline_init")

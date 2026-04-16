@@ -135,7 +135,7 @@ class _StepContext:
         self._span = None
 
     def __enter__(self):
-        self._span = _make_deferred_span("step", self._step)
+        self._span = _make_deferred_span(f"step_{self._step}", self._step)
         self._span.__enter__()
         return _StepSpans(self._step)
 
@@ -246,13 +246,11 @@ def record_memory(label: str = "") -> None:
 
 
 def _record_step_memory(step_idx: int) -> None:
-    """Internal: record memory at end of each diffusion step."""
-    config = get_config()
-    if not config.enabled:
-        return
-    if _tracer is not None:
-        from wan.profiling._memory import record_memory_snapshot
-        record_memory_snapshot(f"step_{step_idx}", None, _tracer, config)
+    """Internal: record memory at end of each diffusion step.
+
+    Memory counters disabled in trace output (not readable in Perfetto).
+    """
+    pass
 
 
 def flush() -> None:
@@ -268,4 +266,4 @@ def flush() -> None:
     if _stopwatch is not None:
         _stopwatch.flush()
     if _tracer is not None:
-        _tracer.flush()
+        _tracer.close()
