@@ -20,7 +20,7 @@ from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
 from .modules.model import WanModel
-from .profiling import profiled_loop, trace_span
+from .profiling import profiled_loop, trace_span, torch_profile_phase
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
 from .utils.fm_solvers import (
@@ -305,8 +305,9 @@ class WanTI2V:
         if not self.t5_cpu:
             with trace_span("t5_to_gpu"):
                 self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
+            with torch_profile_phase("text_encoding"):
+                context = self.text_encoder([input_prompt], self.device)
+                context_null = self.text_encoder([n_prompt], self.device)
             if offload_model:
                 with trace_span("t5_free"):
                     del self.text_encoder
@@ -416,7 +417,8 @@ class WanTI2V:
                     gc.collect()
                     torch.cuda.empty_cache()
             if self.rank == 0:
-                videos = self.vae.decode(x0)
+                with torch_profile_phase("vae_decode"):
+                    videos = self.vae.decode(x0)
 
         del noise, latents
         del sample_scheduler
@@ -515,8 +517,9 @@ class WanTI2V:
         if not self.t5_cpu:
             with trace_span("t5_to_gpu"):
                 self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
+            with torch_profile_phase("text_encoding"):
+                context = self.text_encoder([input_prompt], self.device)
+                context_null = self.text_encoder([n_prompt], self.device)
             if offload_model:
                 with trace_span("t5_free"):
                     del self.text_encoder
@@ -634,7 +637,8 @@ class WanTI2V:
                     torch.cuda.empty_cache()
 
             if self.rank == 0:
-                videos = self.vae.decode(x0)
+                with torch_profile_phase("vae_decode"):
+                    videos = self.vae.decode(x0)
 
         del noise, latent, x0
         del sample_scheduler

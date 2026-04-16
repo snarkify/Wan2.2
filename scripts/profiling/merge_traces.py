@@ -17,6 +17,47 @@ import os
 import sys
 
 
+def _find_l3_offset(l3_events, l2_events, profile_dir, phase_name=None):
+    """Compute timestamp offset to align L3 events to L2 timeline.
+
+    Args:
+        phase_name: If provided, matches this name directly against L2
+            spans (e.g. "text_encoding", "step_2", "vae_decode").
+    """
+    # Find first span event in l3_events
+    l3_first_ts = None
+    for ev in l3_events:
+        if ev.get("ph") in ("X", "B") and "ts" in ev:
+            l3_first_ts = ev["ts"]
+            break
+    if l3_first_ts is None:
+        return 0
+
+    # Build L2 anchor map: span name → first begin timestamp
+    l2_begin = {}
+    for ev in l2_events:
+        if ev.get("ph") == "B" and ev.get("pid") == 0:
+            name = ev.get("name", "")
+            if name not in l2_begin:
+                l2_begin[name] = ev["ts"]
+
+    # Direct match by phase name
+    if phase_name and phase_name in l2_begin:
+        return l2_begin[phase_name] - l3_first_ts
+
+    # ProfilerStep# events (combined trace / old schedule API)
+    for ev in l3_events:
+        name = ev.get("name", "")
+        if name.startswith("ProfilerStep#"):
+            step_num = int(name.split("#")[1])
+            l2_anchor = l2_begin.get(f"step_{step_num}")
+            if l2_anchor is not None:
+                return l2_anchor - ev.get("ts", 0)
+
+    return 0
+
+
+
 def _find_sync_event(events):
     """Find the __trace_sync__ event to extract wall-clock anchor."""
     for ev in events:
@@ -81,14 +122,79 @@ def merge(profile_dir, include_torch=True):
         events = [e for e in events if e.get("name") != "__trace_sync__"]
         all_events.extend(events)
 
-    # Process Layer 3 files — assign to separate tid range
-    for path in l3_files:
+    # Process Layer 3: load per-phase trace files individually for
+    # per-phase timestamp alignment (avoids clock drift between phases).
+    # Fall back to combined chrome trace if no per-phase files exist.
+    l3_phase_files = []
+    for td in glob.glob(os.path.join(profile_dir, "torch_trace_rank*")):
+        l3_phase_files.extend(
+            sorted(glob.glob(os.path.join(td, "*.pt.trace.json"))))
+
+    if l3_phase_files:
+        l3_files_to_process = l3_phase_files
+    else:
+        l3_files_to_process = l3_files  # fall back to combined
+
+    for path in l3_files_to_process:
         events = load_trace_file(path)
-        # Assign torch profiler events to high tid range to separate tracks
+        # Extract phase name from filename for per-phase alignment
+        phase_name = os.path.basename(path).replace(".pt.trace.json", "").replace(".json", "")
+        ts_offset = _find_l3_offset(events, all_events, profile_dir, phase_name=phase_name)
+
+        # Identify CPU pid in L3
+        cpu_pid = None
         for ev in events:
-            if "tid" in ev:
-                ev["tid"] = ev.get("tid", 0) + 1000
-        all_events.extend(events)
+            if ev.get("ph") == "M" and ev.get("name") == "process_labels":
+                if ev.get("args", {}).get("labels") == "CPU":
+                    cpu_pid = ev.get("pid")
+                    break
+
+        # Filter: keep CPU + GPU 0, drop unused GPU 1-15, overhead, string pids
+        used_gpu_pids = {0}
+        filtered = []
+        for ev in events:
+            pid = ev.get("pid")
+            if pid == -1:
+                continue
+            if isinstance(pid, int) and pid not in used_gpu_pids and pid != cpu_pid:
+                if pid > 0:
+                    continue
+            if isinstance(pid, str):
+                continue
+            filtered.append(ev)
+        events = filtered
+
+        # Remap pids: L3 CPU → 100, L3 GPU 0 → 101
+        pid_remap = {}
+        if cpu_pid is not None:
+            pid_remap[cpu_pid] = 100
+        pid_remap[0] = 101
+
+        for ev in events:
+            if "ts" in ev:
+                ev["ts"] = int(ev["ts"] + ts_offset)
+            if "dur" in ev:
+                ev["dur"] = int(ev["dur"]) if ev["dur"] >= 1 else 1
+            pid = ev.get("pid")
+            if pid in pid_remap:
+                ev["pid"] = pid_remap[pid]
+
+        # Filter: drop tiny CPU ops, drop events with negative timestamps
+        kept = []
+        for ev in events:
+            ph = ev.get("ph", "")
+            ts = ev.get("ts", 0)
+            if ts < 0:
+                continue
+            if ph == "M":
+                kept.append(ev)
+            elif ev.get("pid") == pid_remap.get(0):
+                kept.append(ev)
+            elif ph == "X" and ev.get("dur", 0) < 100:
+                continue
+            else:
+                kept.append(ev)
+        all_events.extend(kept)
 
     return all_events
 

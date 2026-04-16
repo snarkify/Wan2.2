@@ -30,6 +30,7 @@ __all__ = [
     "record_memory",
     "setup_profiling",
     "profiled_loop",
+    "torch_profile_phase",
     "flush",
     "init_from_args",
 ]
@@ -143,6 +144,9 @@ class _StepContext:
         result = False
         if self._span is not None:
             result = self._span.__exit__(*exc)
+        # Advance torch.profiler schedule
+        if _torch_profiler is not None:
+            _torch_profiler.step()
         # Memory snapshot per step
         _record_step_memory(self._step)
         return result
@@ -245,6 +249,28 @@ def record_memory(label: str = "") -> None:
     record_memory_snapshot(label, _stopwatch, _tracer, config)
 
 
+@contextmanager
+def torch_profile_phase(name: str):
+    """Context manager for kernel-level profiling of a specific phase.
+
+    Only active when WAN_PROFILE_TORCH=1. Wraps the phase with
+    torch.profiler start/stop and exports a per-phase chrome trace.
+    No-op when torch profiler is disabled.
+    """
+    config = get_config()
+    if not config.enabled:
+        yield
+        return
+    _ensure_initialized()
+    if _torch_profiler is not None:
+        _torch_profiler.phase(name)
+    try:
+        yield
+    finally:
+        if _torch_profiler is not None:
+            _torch_profiler.phase_end()
+
+
 def _record_step_memory(step_idx: int) -> None:
     """Internal: record memory at end of each diffusion step.
 
@@ -262,6 +288,9 @@ def flush() -> None:
     # Resolve any remaining deferred events
     from wan.profiling._event_buffer import get_buffer
     get_buffer().resolve_all(_stopwatch, _tracer)
+    # Export any remaining torch profiler phases (e.g. vae_decode after loop)
+    if _torch_profiler is not None:
+        _torch_profiler.stop()
     # Flush writers
     if _stopwatch is not None:
         _stopwatch.flush()
