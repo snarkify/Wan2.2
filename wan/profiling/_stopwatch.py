@@ -73,11 +73,11 @@ class CudaTimedSpan:
 
     __slots__ = (
         "name", "step", "metadata", "_stopwatch", "_tracer", "_config",
-        "_deferred", "_wall_start", "_cuda_start", "_cuda_end",
+        "_deferred", "_no_cuda", "_wall_start", "_cuda_start", "_cuda_end",
     )
 
     def __init__(self, name, step, metadata, stopwatch, tracer, config,
-                 deferred=False):
+                 deferred=False, no_cuda_events=False):
         self.name = name
         self.step = step
         self.metadata = metadata
@@ -85,13 +85,20 @@ class CudaTimedSpan:
         self._tracer = tracer
         self._config = config
         self._deferred = deferred
+        # When True, skip CUDA event recording entirely. Used for spans
+        # that wrap torch.compile regions where events cause
+        # "Both events must be recorded" errors due to graph reordering.
+        self._no_cuda = no_cuda_events
+        self._cuda_start = None
+        self._cuda_end = None
 
     def __enter__(self):
-        if self._config.sync_before_timing and not self._deferred:
+        if self._config.sync_before_timing and not self._deferred and not self._no_cuda:
             torch.cuda.synchronize()
-        self._cuda_start = torch.cuda.Event(enable_timing=True)
-        self._cuda_end = torch.cuda.Event(enable_timing=True)
-        self._cuda_start.record()
+        if not self._no_cuda:
+            self._cuda_start = torch.cuda.Event(enable_timing=True)
+            self._cuda_end = torch.cuda.Event(enable_timing=True)
+            self._cuda_start.record()
         self._wall_start = time.perf_counter()
         if self._tracer:
             self._tracer.begin(self.name, self.metadata)
@@ -99,8 +106,9 @@ class CudaTimedSpan:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
-            # ALWAYS record end event, even on exception (I-2)
-            self._cuda_end.record()
+            if not self._no_cuda:
+                # ALWAYS record end event, even on exception (I-2)
+                self._cuda_end.record()
             wall_ms = (time.perf_counter() - self._wall_start) * 1000.0
 
             if exc_type is not None:
@@ -113,6 +121,14 @@ class CudaTimedSpan:
                     )
                 if self._stopwatch:
                     self._stopwatch.record(self.name, self.step, wall_ms, -1.0)
+            elif self._no_cuda:
+                # Compiled region: wall-clock only, gpu_ms=-1 marker
+                if self._stopwatch:
+                    self._stopwatch.record(self.name, self.step, wall_ms, -1.0)
+                if self._tracer:
+                    self._tracer.end(
+                        self.name, {"wall_ms": f"{wall_ms:.3f}"}
+                    )
             elif self._deferred:
                 # Deferred path: push to global buffer
                 pending = PendingSpan(
@@ -129,12 +145,8 @@ class CudaTimedSpan:
                     )
             else:
                 # Immediate path: sync and resolve now
-                if self._config.sync_before_timing:
-                    torch.cuda.synchronize()
-                    gpu_ms = self._cuda_start.elapsed_time(self._cuda_end)
-                else:
-                    torch.cuda.synchronize()
-                    gpu_ms = self._cuda_start.elapsed_time(self._cuda_end)
+                torch.cuda.synchronize()
+                gpu_ms = self._cuda_start.elapsed_time(self._cuda_end)
                 if self._stopwatch:
                     self._stopwatch.record(
                         self.name, self.step, wall_ms, gpu_ms

@@ -228,6 +228,12 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to convert model paramerters dtype.")
+    parser.add_argument(
+        "--compile_model",
+        action="store_true",
+        default=False,
+        help="Use torch.compile for the DiT model. First run compiles "
+             "and caches kernels (~30-120s); subsequent runs reuse the cache.")
 
     # animate
     parser.add_argument(
@@ -357,6 +363,29 @@ def generate(args):
     # Initialize profiling (after dist.init so RANK is available)
     profiling_init(args.profile_dir)
 
+    # Set up torch.compile
+    if args.compile_model:
+        logging.info("torch.compile enabled")
+
+    def _compile_dit(pipeline):
+        """Apply torch.compile to DiT model(s) on a pipeline."""
+        if not args.compile_model:
+            return
+        import wan.profiling as _prof
+        compiled_any = False
+        for attr in ("model", "noise_model",
+                      "low_noise_model", "high_noise_model"):
+            if hasattr(pipeline, attr):
+                m = getattr(pipeline, attr)
+                compiled = torch.compile(m)
+                setattr(pipeline, attr, compiled)
+                compiled_any = True
+                logging.info(f"Compiled {attr}")
+        # Tell the profiling framework to skip CUDA events for
+        # spans that wrap compiled forward calls.
+        if compiled_any:
+            _prof._compile_active = True
+
     if args.use_prompt_extend:
         if args.prompt_extend_method == "dashscope":
             prompt_expander = DashScopePromptExpander(
@@ -431,6 +460,7 @@ def generate(args):
             )
 
         setup_profiling(wan_t2v)
+        _compile_dit(wan_t2v)
         logging.info(f"Generating video ...")
         record_memory("pipeline_init")
         with trace_span("pipeline_generate"):
@@ -461,6 +491,7 @@ def generate(args):
             )
 
         setup_profiling(wan_ti2v)
+        _compile_dit(wan_ti2v)
         logging.info(f"Generating video ...")
         record_memory("pipeline_init")
         with trace_span("pipeline_generate"):
@@ -494,6 +525,7 @@ def generate(args):
             )
 
         setup_profiling(wan_animate)
+        _compile_dit(wan_animate)
         logging.info(f"Generating video ...")
         record_memory("pipeline_init")
         with trace_span("pipeline_generate"):
@@ -524,6 +556,7 @@ def generate(args):
                 convert_model_dtype=args.convert_model_dtype,
             )
         setup_profiling(wan_s2v)
+        _compile_dit(wan_s2v)
         logging.info(f"Generating video ...")
         record_memory("pipeline_init")
         with trace_span("pipeline_generate"):
@@ -563,6 +596,7 @@ def generate(args):
                 convert_model_dtype=args.convert_model_dtype,
             )
         setup_profiling(wan_i2v)
+        _compile_dit(wan_i2v)
         logging.info("Generating video ...")
         record_memory("pipeline_init")
         with trace_span("pipeline_generate"):

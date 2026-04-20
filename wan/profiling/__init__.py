@@ -43,6 +43,7 @@ _tracer = None
 _torch_profiler = None
 _initialized = False
 _in_loop = False  # Set by profiled_loop(), used by hooks for deferred mode
+_compile_active = False  # Set when torch.compile is in use on DiT models
 
 
 def _ensure_initialized():
@@ -164,6 +165,25 @@ class _StepProfiler:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+# Names of spans that wrap compiled forward calls. CUDA events are
+# unreliable inside torch.compile regions — they can fire out of order
+# due to kernel fusion/reordering, causing "Both events must be recorded"
+# errors. When _compile_active is True, these spans use wall-clock only.
+_COMPILED_SPAN_NAMES = {"model_forward_cond", "model_forward_uncond"}
+
+
+def _span_skips_cuda_events(name: str) -> bool:
+    """Whether a span named ``name`` should skip CUDA event recording."""
+    if not _compile_active:
+        return False
+    if name in _COMPILED_SPAN_NAMES:
+        return True
+    # Hook-based DiT forward spans: model_forward/<attr>
+    if name.startswith("model_forward/"):
+        return True
+    return False
+
+
 def trace_span(name: str, step: int = -1, metadata: dict | None = None):
     """Context manager for timing a code region.
 
@@ -175,7 +195,9 @@ def trace_span(name: str, step: int = -1, metadata: dict | None = None):
     _ensure_initialized()
     from wan.profiling._stopwatch import CudaTimedSpan
     return CudaTimedSpan(
-        name, step, metadata, _stopwatch, _tracer, config, deferred=False
+        name, step, metadata, _stopwatch, _tracer, config,
+        deferred=False,
+        no_cuda_events=_span_skips_cuda_events(name),
     )
 
 
@@ -187,7 +209,9 @@ def _make_deferred_span(name: str, step: int):
     _ensure_initialized()
     from wan.profiling._stopwatch import CudaTimedSpan
     return CudaTimedSpan(
-        name, step, None, _stopwatch, _tracer, config, deferred=True
+        name, step, None, _stopwatch, _tracer, config,
+        deferred=True,
+        no_cuda_events=_span_skips_cuda_events(name),
     )
 
 
