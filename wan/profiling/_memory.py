@@ -3,13 +3,14 @@
 import torch
 
 
-def record_memory_snapshot(label, stopwatch, tracer, config):
+def record_memory_snapshot(label, stopwatch, tracer, config, reset_peak=False):
     """Record current GPU memory stats as CSV row + Chrome Trace counter.
 
-    Metrics:
-      - memory_allocated_mb: currently allocated by tensors
-      - memory_reserved_mb: total reserved by the caching allocator
-      - max_memory_allocated_mb: peak since last reset
+    CSV row uses wall_ms=allocated_mb, gpu_ms=peak_mb as a packing hack.
+
+    Args:
+        reset_peak: If True, reset the peak memory stats after recording, so
+            the next snapshot's peak captures only the intervening section.
     """
     if not torch.cuda.is_available():
         return
@@ -22,15 +23,12 @@ def record_memory_snapshot(label, stopwatch, tracer, config):
     except RuntimeError:
         return
 
-    values = {
-        "memory_allocated_mb": round(allocated, 1),
-        "memory_reserved_mb": round(reserved, 1),
-        "max_memory_allocated_mb": round(peak, 1),
-    }
-
-    # Memory counters disabled in trace (not readable in Perfetto).
-    # Still recorded in CSV via stopwatch below.
-
     if stopwatch is not None:
         name = f"memory/{label}" if label else "memory"
         stopwatch.record(name, -1, allocated, peak)
+
+    if reset_peak:
+        try:
+            torch.cuda.reset_peak_memory_stats(device)
+        except RuntimeError:
+            pass

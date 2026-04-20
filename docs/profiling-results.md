@@ -128,3 +128,86 @@ The `.tolist()` creates unbacked symbolic ints that trigger `GuardOnDataDependen
 **Expected payoff vs JIT**: ~5-10% additional speedup (170-175s vs 183s) + zero warmup cost per run. Only worth it for production serving at fixed shapes.
 
 **Decision**: Not pursued. JIT `torch.compile` provides most of the benefit with no model changes needed.
+
+### FSDP + Ulysses on 4× RTX 5090 (TI2V-5B)
+
+**Both work and compose.** With the FSDP cleanup fix below, 161 frames at 1280×704 fits comfortably.
+
+| Config | Frames | Peak GB (rank 0) | Diffusion | Total |
+|---|---|---|---|---|
+| 1 GPU baseline | 81 | 27.0 | 213s | 310s |
+| 4 GPU FSDP | 81 | 23.3 | 212s | 310s |
+| 4 GPU FSDP + Ulysses | 81 | 27.1 | **131s** (1.6×) | 230s |
+| 4 GPU FSDP + Ulysses | **161** | **24.3** | 233s | 351s |
+| 4 GPU Ulysses only | 81 | — | — | OOM at T5+fp32 DiT (21.8+10.8>32GB) |
+
+**Memory decomposition (1 GPU baseline, 81 frames, fp32 DiT):**
+
+| Stage | allocated | notes |
+|---|---|---|
+| VAE loaded | 2.7 GB | |
+| T5 on GPU | 13.5 GB | T5-XXL bf16 = 10.8 GB |
+| T5 freed | 2.7 GB | back to VAE |
+| DiT on GPU | 21.8 GB | fp32 DiT = 19.1 GB (passing `--convert_model_dtype` halves this) |
+| Diffusion step peak | 27.0 GB | activations ≈ 5.2 GB |
+| VAE decode peak | 23.1 GB | **chunked** — ~16 GB workspace, roughly frame-independent |
+
+**Key findings:**
+- **FSDP shards DiT cleanly**: 19.1 GB → 4.8 GB per GPU (4×).
+- **Ulysses reduces activations** ~48–62% (not the full 4× — FSDP all-gather buffers and cross-attn don't shard).
+- **Diffusion peak stays low** with FSDP+Ulysses: 10.5 GB at 81f, 12.9 GB at 161f. Plenty of room for more frames on the diffusion path.
+- **VAE decode is the ceiling**, not diffusion. It runs on rank 0 only, doesn't use Ulysses, but is internally chunked so it scales sub-linearly with frames.
+- **Ulysses alone infeasible with fp32 DiT** — full DiT (19.1 GB) + T5 on GPU (10.8 GB) > 32 GB. Pair with FSDP or `--convert_model_dtype`.
+
+**FSDP cleanup bug (fixed):**
+
+`del self.model` did not release FSDP-sharded weights. `after_dit_free` showed 7.8 GB still allocated vs 2.9 GB on single-GPU baseline — the 4.9 GB FlatParameter storage was pinned by FSDP's internal handles. This caused VAE decode to OOM.
+
+Fix: call `free_model(self.model)` (from `wan/distributed/fsdp.py:39`) before `self.model = None`. It walks FSDP submodules and calls `_free_storage(m._handle.flat_param.data)` to explicitly resize storage to 0 bytes. After fix: `after_dit_free` drops to 3.0 GB on the FSDP-only run.
+
+Note: when `use_sp=True` (Ulysses), `after_dit_free` still shows ~7.9 GB retained — likely from `sp_attn_forward`/`sp_dit_forward` monkey-patch closures or persistent all-to-all NCCL buffers, separate from the FlatParameter. The run still fits because VAE decode's chunked workspace is smaller than that residual + budget.
+
+**Reproduce:**
+
+```bash
+CKPT=/workspace/Wan2.2-TI2V-5B
+PROMPT='A cat walking through a sunlit meadow'
+OUT=/workspace/profile_outputs
+export WAN_PROFILE_FLUSH_INTERVAL=1  # persist CSV row-by-row (survives crashes)
+
+# 1 GPU baseline
+python generate.py --task ti2v-5B --size '1280*704' --frame_num 81 \
+  --ckpt_dir $CKPT --offload_model True \
+  --profile_dir $OUT/baseline_1gpu_81f --prompt "$PROMPT"
+
+# 4 GPU FSDP only
+torchrun --nproc_per_node=4 --master_port=29500 generate.py \
+  --task ti2v-5B --size '1280*704' --frame_num 81 \
+  --ckpt_dir $CKPT --offload_model True --dit_fsdp \
+  --profile_dir $OUT/fsdp_only_81f --prompt "$PROMPT"
+
+# 4 GPU FSDP + Ulysses, 81 frames
+torchrun --nproc_per_node=4 --master_port=29500 generate.py \
+  --task ti2v-5B --size '1280*704' --frame_num 81 \
+  --ckpt_dir $CKPT --offload_model True --dit_fsdp --ulysses_size 4 \
+  --profile_dir $OUT/fsdp_ulysses_81f --prompt "$PROMPT"
+
+# 4 GPU FSDP + Ulysses, 161 frames (enabled by the fix)
+torchrun --nproc_per_node=4 --master_port=29500 generate.py \
+  --task ti2v-5B --size '1280*704' --frame_num 161 \
+  --ckpt_dir $CKPT --offload_model True --dit_fsdp --ulysses_size 4 \
+  --profile_dir $OUT/fsdp_ulysses_161f --prompt "$PROMPT"
+```
+
+**Read results**: memory rows are written to `timing_rank0.csv` with the format
+`run_id,rank,memory/<label>,-1,<allocated_mb>,<peak_mb>,<timestamp>`.
+Labels emitted per stage: `init_start`, `after_load_{t5,vae,dit}`, `after_t5_to_gpu`, `after_text_encoding`, `after_t5_free`, `after_dit_to_gpu`, `step_N` (per diffusion step), `after_diffusion_loop`, `after_dit_free`, `after_vae_decode`, `pipeline_end`.
+
+Quick one-liner for peak + timing:
+```bash
+awk -F, '/memory\// {if ($6+0>mx) mx=$6+0} \
+  /memory\/init_start/ {st=$7} /memory\/pipeline_end/ {en=$7} \
+  /memory\/after_dit_to_gpu/ {d0=$7} /memory\/after_diffusion_loop/ {d1=$7} \
+  END {printf "peak=%.0fMB total=%.1fs diffusion=%.1fs\n", mx, en-st, d1-d0}' \
+  $OUT/<run>/timing_rank0.csv
+```

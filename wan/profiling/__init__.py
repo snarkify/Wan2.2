@@ -263,14 +263,18 @@ def trace_counter(name: str, values: dict) -> None:
         _tracer.counter(name, values)
 
 
-def record_memory(label: str = "") -> None:
-    """Record GPU memory snapshot as CSV row + Chrome Trace counter."""
+def record_memory(label: str = "", reset_peak: bool = False) -> None:
+    """Record GPU memory snapshot as CSV row.
+
+    When reset_peak=True, resets peak counter after recording so the next
+    snapshot captures peak over the intervening section only.
+    """
     config = get_config()
     if not config.enabled:
         return
     _ensure_initialized()
     from wan.profiling._memory import record_memory_snapshot
-    record_memory_snapshot(label, _stopwatch, _tracer, config)
+    record_memory_snapshot(label, _stopwatch, _tracer, config, reset_peak=reset_peak)
 
 
 @contextmanager
@@ -296,11 +300,14 @@ def torch_profile_phase(name: str):
 
 
 def _record_step_memory(step_idx: int) -> None:
-    """Internal: record memory at end of each diffusion step.
-
-    Memory counters disabled in trace output (not readable in Perfetto).
-    """
-    pass
+    """Record per-step memory peak and reset for the next step."""
+    config = get_config()
+    if not config.enabled or _stopwatch is None:
+        return
+    from wan.profiling._memory import record_memory_snapshot
+    record_memory_snapshot(
+        f"step_{step_idx}", _stopwatch, _tracer, config, reset_peak=True
+    )
 
 
 def flush() -> None:

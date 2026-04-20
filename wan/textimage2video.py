@@ -16,11 +16,11 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
 
-from .distributed.fsdp import shard_model
+from .distributed.fsdp import free_model, shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
 from .modules.model import WanModel
-from .profiling import profiled_loop, trace_span, torch_profile_phase
+from .profiling import profiled_loop, record_memory, trace_span, torch_profile_phase
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
 from .utils.fm_solvers import (
@@ -86,6 +86,7 @@ class WanTI2V:
             self.init_on_cpu = False
 
         shard_fn = partial(shard_model, device_id=device_id)
+        record_memory("init_start", reset_peak=True)
         with trace_span("load_t5"):
             self.text_encoder = T5EncoderModel(
                 text_len=config.text_len,
@@ -96,6 +97,7 @@ class WanTI2V:
                 tokenizer_path=os.path.join(checkpoint_dir,
                                             config.t5_tokenizer),
                 shard_fn=shard_fn if t5_fsdp else None)
+        record_memory("after_load_t5", reset_peak=True)
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
@@ -103,6 +105,7 @@ class WanTI2V:
             self.vae = Wan2_2_VAE(
                 vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
                 device=self.device)
+        record_memory("after_load_vae", reset_peak=True)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         with trace_span("load_dit"):
@@ -113,6 +116,7 @@ class WanTI2V:
                 dit_fsdp=dit_fsdp,
                 shard_fn=shard_fn,
                 convert_model_dtype=convert_model_dtype)
+        record_memory("after_load_dit", reset_peak=True)
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -305,14 +309,17 @@ class WanTI2V:
         if not self.t5_cpu:
             with trace_span("t5_to_gpu"):
                 self.text_encoder.model.to(self.device)
+            record_memory("after_t5_to_gpu", reset_peak=True)
             with torch_profile_phase("text_encoding"):
                 context = self.text_encoder([input_prompt], self.device)
                 context_null = self.text_encoder([n_prompt], self.device)
+            record_memory("after_text_encoding", reset_peak=True)
             if offload_model:
                 with trace_span("t5_free"):
                     del self.text_encoder
                     gc.collect()
                     torch.cuda.empty_cache()
+                record_memory("after_t5_free", reset_peak=True)
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
@@ -375,6 +382,7 @@ class WanTI2V:
                 with trace_span("dit_to_gpu"):
                     self.model.to(self.device)
                     torch.cuda.empty_cache()
+            record_memory("after_dit_to_gpu", reset_peak=True)
 
             with profiled_loop() as loop:
               for step_idx, t in enumerate(tqdm(timesteps)):
@@ -410,15 +418,19 @@ class WanTI2V:
                             return_dict=False,
                             generator=seed_g)[0]
                     latents = [temp_x0.squeeze(0)]
+            record_memory("after_diffusion_loop", reset_peak=True)
             x0 = latents
             if offload_model:
                 with trace_span("dit_free"):
-                    del self.model
+                    free_model(self.model)
+                    self.model = None
                     gc.collect()
                     torch.cuda.empty_cache()
+                record_memory("after_dit_free", reset_peak=True)
             if self.rank == 0:
                 with torch_profile_phase("vae_decode"):
                     videos = self.vae.decode(x0)
+                record_memory("after_vae_decode", reset_peak=True)
 
         del noise, latents
         del sample_scheduler
