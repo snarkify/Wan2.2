@@ -78,3 +78,53 @@ pipeline_generate (241s)
 |---|---|---|
 | TI2V-5B, 5 frames, no FSDP | `~/Downloads/wan2.2_profile/` | First successful run. Peak 29.6GB. |
 | T2V-A14B, 17 frames, FSDP2 | `~/Downloads/wan2.2_fsdp2_17f/` | FSDP2 working at 17 frames. Shows clean sharding. |
+| TI2V-5B, 81 frames, kernel traces | `~/Downloads/wan2.2_ti2v5b_kernel_trace/` | Merged L2 + L3 traces (app-level spans + CUDA kernel events for T5 encoding, step_2, and VAE decode phases). |
+
+## Optimization experiments
+
+### JIT compilation (`torch.compile`)
+
+**Works.** ~20% speedup on diffusion loop.
+
+| Mode | Step 1 (warmup) | Steady-state step | Diffusion (50 steps) |
+|---|---|---|---|
+| Eager | 4.3s | 4.25s | ~213s |
+| JIT (first run) | 16.6s (compile) | 3.41s | ~183s |
+| JIT (cached) | 8.2s | 3.41s | ~174s |
+
+**Command:**
+```bash
+TORCHINDUCTOR_CACHE_DIR=/workspace/.compile_cache \
+python generate.py --task ti2v-5B --size 1280*704 --frame_num 81 \
+  --ckpt_dir /workspace/Wan2.2-TI2V-5B \
+  --offload_model True --compile_model \
+  --profile_dir ./profile_output \
+  --prompt "..."
+```
+
+**Cache behavior**: Keyed on tensor shapes + dtypes. Same prompt/seed → cache hit. Different `--frame_num` or `--size` → recompile (first time for that value). Cache persists at `/workspace/.compile_cache/` (~19MB per shape config).
+
+**Profiling integration**: CUDA events are unreliable inside compiled regions (graph reordering breaks start/end event pairing). The profiling framework detects `_compile_active` and falls back to wall-clock only for `model_forward_cond`, `model_forward_uncond`, and `model_forward/*` hook spans. All other spans (T5, VAE, scheduler, step_N) keep full wall + GPU timing.
+
+### AOTInductor (ahead-of-time compilation)
+
+**Blocked** on the current model code. Investigation preserved for future reference.
+
+Attempted `torch.export.export()` + `torch._inductor.aoti_compile_and_package()` on the TI2V-5B DiT. Fails at `wan/modules/model.py:57` in `rope_apply`:
+
+```python
+for i, (f, h, w) in enumerate(grid_sizes.tolist()):  # unbacked symints
+    seq_len = f * h * w
+    freqs_i = torch.cat([
+        freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        ...
+    ])
+```
+
+The `.tolist()` creates unbacked symbolic ints that trigger `GuardOnDataDependentSymNode` when used as tensor shapes. This is a fundamental incompatibility: AOT requires the full graph to trace, while JIT falls back to eager on graph breaks.
+
+**Effort to fix**: 4 hours (best case, annotations only) to 1 week (worst case, multiple rewrites). Main blocker is the rope_apply rewrite to avoid `.tolist()`. Additional potential blockers in `flash_attention`, list IO, and runtime asserts.
+
+**Expected payoff vs JIT**: ~5-10% additional speedup (170-175s vs 183s) + zero warmup cost per run. Only worth it for production serving at fixed shapes.
+
+**Decision**: Not pursued. JIT `torch.compile` provides most of the benefit with no model changes needed.
