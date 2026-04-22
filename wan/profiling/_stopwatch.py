@@ -18,6 +18,7 @@ class StopwatchRecorder:
         self._config = config
         self._lock = threading.Lock()
         self._buffer: list[list] = []
+        self._closed = False
         self._path = os.path.join(
             config.output_dir, f"timing_rank{config.rank}.csv"
         )
@@ -44,6 +45,8 @@ class StopwatchRecorder:
             f"{time.time():.6f}",
         ]
         with self._lock:
+            if self._closed:
+                return  # swallow late writes (e.g. background sampler)
             self._buffer.append(row)
             if len(self._buffer) >= self._config.flush_interval:
                 self._flush_locked()
@@ -60,7 +63,9 @@ class StopwatchRecorder:
 
     def close(self) -> None:
         self.flush()
-        self._file.close()
+        with self._lock:
+            self._closed = True
+            self._file.close()
 
 
 class CudaTimedSpan:

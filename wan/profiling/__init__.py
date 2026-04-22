@@ -41,13 +41,14 @@ __all__ = [
 _stopwatch = None
 _tracer = None
 _torch_profiler = None
+_gpu_sampler = None
 _initialized = False
 _in_loop = False  # Set by profiled_loop(), used by hooks for deferred mode
 _compile_active = False  # Set when torch.compile is in use on DiT models
 
 
 def _ensure_initialized():
-    global _stopwatch, _tracer, _torch_profiler, _initialized
+    global _stopwatch, _tracer, _torch_profiler, _gpu_sampler, _initialized
     if _initialized:
         return
     config = get_config()
@@ -70,6 +71,17 @@ def _ensure_initialized():
             _torch_profiler = TorchProfilerWrapper(config)
         except Exception:
             pass  # torch.profiler may not be available
+
+    if os.environ.get("WAN_PROFILE_GPU_SAMPLER", "1") == "1":
+        try:
+            from wan.profiling._gpu_sampler import GpuSampler
+            interval_ms = int(os.environ.get("WAN_PROFILE_GPU_SAMPLE_MS", "100"))
+            _gpu_sampler = GpuSampler(
+                config, _stopwatch, _tracer, interval_ms=interval_ms
+            )
+            _gpu_sampler.start()
+        except Exception:
+            pass
 
     _initialized = True
 
@@ -322,6 +334,9 @@ def flush() -> None:
     # Export any remaining torch profiler phases (e.g. vae_decode after loop)
     if _torch_profiler is not None:
         _torch_profiler.stop()
+    # Stop GPU sampler before closing writers
+    if _gpu_sampler is not None:
+        _gpu_sampler.close()
     # Flush writers
     if _stopwatch is not None:
         _stopwatch.flush()

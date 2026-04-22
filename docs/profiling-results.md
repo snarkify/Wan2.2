@@ -211,3 +211,48 @@ awk -F, '/memory\// {if ($6+0>mx) mx=$6+0} \
   END {printf "peak=%.0fMB total=%.1fs diffusion=%.1fs\n", mx, en-st, d1-d0}' \
   $OUT/<run>/timing_rank0.csv
 ```
+
+## GPU utilization sampler
+
+Background thread polls NVML on a fixed interval (default 100 ms) and writes one CSV row per metric alongside the regular timing rows. Also emitted as a Chrome Trace `gpu_sampler` counter so Perfetto plots all series under the span timeline.
+
+**Metrics** (one row each per tick, `name` column carries the metric, `wall_ms` carries the value, `gpu_ms` is always `-1`):
+
+| name | meaning | source |
+|---|---|---|
+| `gpu/util` | % of sample window any kernel was running (NVML rolling ~1 s avg) | `nvmlDeviceGetUtilizationRates().gpu` |
+| `gpu/mem_bw_pct` | % of sample window memory controller was busy — **bandwidth**, not capacity | `nvmlDeviceGetUtilizationRates().memory` |
+| `gpu/power_w` | power draw in watts | `nvmlDeviceGetPowerUsage` |
+| `gpu/sm_mhz` | SM clock in MHz | `nvmlDeviceGetClockInfo(NVML_CLOCK_SM)` |
+| `gpu/temp_c` | GPU temperature in Celsius | `nvmlDeviceGetTemperature` |
+| `gpu/mem_used_mb` | resident memory in MB (all processes on the GPU) | `nvmlDeviceGetMemoryInfo().used` |
+| `gpu/throttle_reasons` | NVML bitmask; 0 = no throttling | `nvmlDeviceGetCurrentClocksThrottleReasons` |
+
+**Enable/disable** (on by default when profiling is enabled):
+
+| Env var | Default | Effect |
+|---|---|---|
+| `WAN_PROFILE_GPU_SAMPLER` | `1` | set to `0` to disable the sampler entirely |
+| `WAN_PROFILE_GPU_SAMPLE_MS` | `100` | polling interval in ms |
+| `WAN_PROFILE_GPU_SAMPLER_RANKS` | `0` | rank filter: `0` (rank 0 only), `all`, or comma list e.g. `0,2` |
+
+**Read results** — mean + max utilization and peak memory for rank 0:
+
+```bash
+awk -F, '$3=="gpu/util"       {n++; s+=$5; if($5>mx)mx=$5} \
+         $3=="gpu/mem_used_mb"{if($5>mm)mm=$5} \
+         $3=="gpu/power_w"    {if($5>pw)pw=$5} \
+         END{printf "util mean=%.1f%% max=%.0f%% | mem peak=%.0fMB | power peak=%.0fW (n=%d)\n", \
+             s/(n?n:1), mx, mm, pw, n}' \
+  $OUT/<run>/timing_rank0.csv
+```
+
+To visualize over time, open `trace_rank0.json` in Perfetto — the `gpu_sampler` counter lane shows every series aligned with diffusion spans.
+
+**Caveats**:
+
+- `gpu/util` and `gpu/mem_bw_pct` are rolling ~1 s averages inside NVML, not instantaneous. Sub-second spikes will be smoothed out; oversampling below 500 ms mostly buys alignment, not resolution.
+- `gpu/mem_bw_pct` is memory-BANDWIDTH utilization (% of time any memory read/write was in flight). It is NOT "% of VRAM used" — use `gpu/mem_used_mb` for capacity.
+- `gpu/mem_used_mb` comes from NVML and reports all resident memory on the physical GPU, including other processes. On a shared host this will be higher than the process-local figure from `record_memory`.
+- Under `CUDA_VISIBLE_DEVICES` the sampler resolves NVML handles by UUID (via `torch.cuda.get_device_properties(local_rank).uuid`) because `nvmlDeviceGetHandleByIndex` takes PHYSICAL indices and does not honour the visibility mask. Using `local_rank` directly would silently sample the wrong GPU.
+- By default only rank 0 samples, to avoid 4× redundant rows under DDP/FSDP. Set `WAN_PROFILE_GPU_SAMPLER_RANKS=all` to diagnose per-GPU imbalance (e.g. VAE decode on rank 0 only, Ulysses all-to-all skew).

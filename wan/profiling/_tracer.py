@@ -107,6 +107,8 @@ class TraceWriter:
             "args": values,
         }
         with self._lock:
+            if self._closed:
+                return  # swallow late writes (e.g. background sampler)
             self._write_event(event)
 
     def flush(self) -> None:
