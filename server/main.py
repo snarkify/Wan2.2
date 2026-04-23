@@ -36,9 +36,19 @@ log = logging.getLogger("server.main")
 
 
 def _init_distributed() -> tuple[int, int, int]:
-    """Return (rank, world_size, local_rank)."""
+    """Return (rank, world_size, local_rank).
+
+    The default NCCL watchdog timeout (10 min) kills the process group
+    whenever ranks 1..3 idle in dist.broadcast_object_list waiting for
+    rank 0 to post the next job — a real concern for a long-lived demo
+    server that's often idle. Bump to 24 h.
+    """
+    from datetime import timedelta
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(hours=24),
+        )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))

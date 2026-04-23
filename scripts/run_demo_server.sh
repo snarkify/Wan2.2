@@ -28,6 +28,11 @@ MASTER_PORT="${WAN_DEMO_MASTER_PORT:-29600}"
 # decode workspace on 4090s (see docs/profiling-results.md).
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+# Disable NCCL async error handling — the demo sits idle in
+# broadcast_object_list between jobs and the watchdog would otherwise
+# abort after 10 min.
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-0}"
+
 # Disable profiling CSV/trace output by default — the server is long-running
 # and the profiling layer isn't designed for multi-request persistence yet.
 unset WAN_PROFILE_DIR || true
