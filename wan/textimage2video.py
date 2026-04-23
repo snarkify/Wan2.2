@@ -307,7 +307,11 @@ class WanTI2V:
         seed_g.manual_seed(seed)
 
         if not self.t5_cpu:
-            with trace_span("t5_to_gpu"):
+            t5_bytes = sum(
+                p.element_size() * p.numel()
+                for p in self.text_encoder.model.parameters()
+            )
+            with trace_span("t5_to_gpu", metadata={"bytes": str(t5_bytes)}):
                 self.text_encoder.model.to(self.device)
             record_memory("after_t5_to_gpu", reset_peak=True)
             with torch_profile_phase("text_encoding"):
@@ -379,7 +383,11 @@ class WanTI2V:
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
             if offload_model or self.init_on_cpu:
-                with trace_span("dit_to_gpu"):
+                dit_bytes = sum(
+                    p.element_size() * p.numel()
+                    for p in self.model.parameters()
+                )
+                with trace_span("dit_to_gpu", metadata={"bytes": str(dit_bytes)}):
                     self.model.to(self.device)
                     torch.cuda.empty_cache()
             record_memory("after_dit_to_gpu", reset_peak=True)

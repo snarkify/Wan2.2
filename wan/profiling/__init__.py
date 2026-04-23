@@ -28,12 +28,23 @@ __all__ = [
     "trace_span",
     "trace_counter",
     "record_memory",
+    "record_collective",
     "setup_profiling",
     "profiled_loop",
     "torch_profile_phase",
     "flush",
     "init_from_args",
 ]
+
+
+def record_collective(op: str, nbytes: int, wall_ms: float, gpu_ms: float) -> None:
+    """Record one NCCL collective call. See _collectives.py."""
+    config = get_config()
+    if not config.enabled:
+        return
+    _ensure_initialized()
+    from wan.profiling._collectives import record_collective as _rc
+    _rc(op, nbytes, wall_ms, gpu_ms)
 
 # ---------------------------------------------------------------------------
 # Lazy-initialized singletons
@@ -83,7 +94,31 @@ def _ensure_initialized():
         except Exception:
             pass
 
+    _record_env_info()
     _initialized = True
+
+
+def _record_env_info() -> None:
+    """One-shot: log attention backend, torch version, device name."""
+    if _stopwatch is None:
+        return
+    try:
+        from wan.modules.attention import (
+            FLASH_ATTN_2_AVAILABLE, FLASH_ATTN_3_AVAILABLE,
+        )
+        if FLASH_ATTN_3_AVAILABLE:
+            backend = "flash_attn_3"
+        elif FLASH_ATTN_2_AVAILABLE:
+            backend = "flash_attn_2"
+        else:
+            backend = "sdpa"
+    except Exception:
+        backend = "unknown"
+
+    # Pack as step field via stopwatch.record with recognizable name.
+    # The info goes in the run_id metadata; we log a one-liner row that awk
+    # can `grep env/attn_backend` to find.
+    _stopwatch.record(f"env/attn_backend/{backend}", -1, -1.0, -1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +372,9 @@ def flush() -> None:
     # Stop GPU sampler before closing writers
     if _gpu_sampler is not None:
         _gpu_sampler.close()
+    # Emit aggregate collective totals
+    from wan.profiling._collectives import flush_totals
+    flush_totals()
     # Flush writers
     if _stopwatch is not None:
         _stopwatch.flush()

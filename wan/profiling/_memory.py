@@ -26,6 +26,13 @@ def record_memory_snapshot(label, stopwatch, tracer, config, reset_peak=False):
     if stopwatch is not None:
         name = f"memory/{label}" if label else "memory"
         stopwatch.record(name, -1, allocated, peak)
+        # Fragmentation = reserved - allocated. Large values mean the caching
+        # allocator is holding onto freed blocks that can't be reused for the
+        # next alloc (usually due to size mismatch). wall_ms carries MB.
+        stopwatch.record(
+            f"memory_frag/{label}" if label else "memory_frag",
+            -1, max(0.0, reserved - allocated), reserved,
+        )
 
     if reset_peak:
         try:
