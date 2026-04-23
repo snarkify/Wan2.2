@@ -20,7 +20,13 @@ from .distributed.fsdp import free_model, shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
 from .modules.model import WanModel
-from .profiling import profiled_loop, record_memory, trace_span, torch_profile_phase
+from .profiling import (
+    cpu_profile,
+    profiled_loop,
+    record_memory,
+    torch_profile_phase,
+    trace_span,
+)
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
 from .utils.fm_solvers import (
@@ -418,7 +424,7 @@ class WanTI2V:
                         noise_pred = noise_pred_uncond + guide_scale * (
                             noise_pred_cond - noise_pred_uncond)
 
-                    with spans.span("scheduler_step"):
+                    with spans.span("scheduler_step"), cpu_profile("scheduler"):
                         temp_x0 = sample_scheduler.step(
                             noise_pred.unsqueeze(0),
                             t,

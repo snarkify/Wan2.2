@@ -32,9 +32,16 @@ __all__ = [
     "setup_profiling",
     "profiled_loop",
     "torch_profile_phase",
+    "cpu_profile",
     "flush",
     "init_from_args",
 ]
+
+
+def cpu_profile(name: str):
+    """Opt-in cProfile wrapper. See _cpu_profile.py."""
+    from wan.profiling._cpu_profile import cpu_profile as _cp
+    return _cp(name)
 
 
 def record_collective(op: str, nbytes: int, wall_ms: float, gpu_ms: float) -> None:
@@ -375,6 +382,9 @@ def flush() -> None:
     # Emit aggregate collective totals
     from wan.profiling._collectives import flush_totals
     flush_totals()
+    # Dump any cProfile regions
+    from wan.profiling._cpu_profile import flush_all as _cp_flush
+    _cp_flush(config.output_dir, config.rank)
     # Flush writers
     if _stopwatch is not None:
         _stopwatch.flush()
