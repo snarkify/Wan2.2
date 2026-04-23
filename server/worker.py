@@ -4,6 +4,14 @@ rank 0 drives the HTTP server + queue, and broadcasts each job to all
 ranks via torch.distributed. Ranks 1..3 live in worker_client_loop()
 waiting for broadcasts and calling the same pipeline.generate().
 
+A fresh WanTI2V pipeline is **constructed for every request**. We tried
+keeping a persistent pipeline with reuse=True (moving T5+DiT between
+CPU and GPU between requests), but .to('cpu') on an FSDP-wrapped model
+doesn't release the FlatParameter storage, so VAE decode OOMed on
+24 GB 4090s. Reloading per request adds ~95s of model-load overhead
+per job but is known-working (same path as the measured standalone
+runs in docs/profiling-results.md).
+
 Protocol (wrapped in a one-element list for broadcast_object_list):
     {"op": "generate", "kwargs": {...}}     # run a job
     {"op": "shutdown"}                       # clean exit
@@ -46,7 +54,6 @@ def _receive() -> dict[str, Any]:
 
 async def worker_driver_loop(
     store: JobStore,
-    pipeline,            # type: WanTI2V  (avoid top-level import cost)
     config: Config,
     video_base_url: str,
 ) -> None:
@@ -62,17 +69,27 @@ async def worker_driver_loop(
         log.info("worker: picking up job=%s prompt=%r", job.id, job.prompt[:80])
         await store.mark_running(job.id)
 
-        msg = {"op": "generate", "kwargs": _build_kwargs(job)}
+        msg = {"op": "generate", "kwargs": _build_kwargs(job), "ckpt_dir": config.ckpt_dir}
         try:
             _broadcast(msg)
             # Run the actual generation on rank 0's thread pool so the
             # asyncio loop stays responsive to HTTP and health checks.
+            # We construct and destroy the pipeline inside the executor
+            # so nothing stays resident between requests.
             video_tensor = await loop.run_in_executor(
-                None, _run_generate, pipeline, msg["kwargs"]
+                None, _build_and_run, msg["ckpt_dir"], msg["kwargs"]
             )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             log.exception("worker: job=%s generation failed", job.id)
+            # Best-effort cleanup so the next request isn't starved by
+            # leftover tensors from a mid-decode OOM.
+            try:
+                import gc as _gc
+                _gc.collect()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
             await store.mark_failed(job.id, err)
             job.status = "failed"
             job.error = err
@@ -106,8 +123,12 @@ async def worker_driver_loop(
             )
 
 
-def worker_client_loop(pipeline) -> None:
-    """Ranks 1..3: loop receiving broadcasts and participating in generation."""
+def worker_client_loop() -> None:
+    """Ranks 1..3: loop receiving broadcasts and participating in generation.
+
+    Constructs a fresh pipeline per request (matches rank 0 behavior)
+    so FSDP/NCCL state is reset between jobs.
+    """
     log.info("worker client loop started on rank=%s", os.environ.get("RANK"))
     while True:
         try:
@@ -121,7 +142,7 @@ def worker_client_loop(pipeline) -> None:
             return
         if op == "generate":
             try:
-                _run_generate(pipeline, msg["kwargs"])
+                _build_and_run(msg["ckpt_dir"], msg["kwargs"])
             except Exception:
                 # On non-driver ranks, errors can't be reported back over
                 # the distributed group without breaking the next
@@ -147,7 +168,6 @@ def _build_kwargs(job: Job) -> dict[str, Any]:
         "seed": int(p.get("seed", -1)),
         "sampling_steps": int(p.get("sampling_steps", 50)),
         "offload_model": True,
-        "reuse": True,
     }
 
 
@@ -157,9 +177,41 @@ def _parse_size(s: str) -> tuple[int, int]:
     return int(w), int(h)
 
 
-def _run_generate(pipeline, kwargs: dict[str, Any]):
-    """Call the pipeline; returns tensor on rank 0, None on other ranks."""
-    return pipeline.generate(**kwargs)
+def _build_and_run(ckpt_dir: str, kwargs: dict[str, Any]):
+    """Construct a fresh WanTI2V, run one generation, let GC destroy it.
+
+    Called from all ranks. Returns the tensor on rank 0, None elsewhere.
+    """
+    import gc
+    from wan import configs as wan_configs
+    from wan.textimage2video import WanTI2V
+
+    cfg = wan_configs.WAN_CONFIGS["ti2v-5B"]
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+
+    pipeline = WanTI2V(
+        config=cfg,
+        checkpoint_dir=ckpt_dir,
+        device_id=local_rank,
+        rank=rank,
+        t5_fsdp=False,
+        dit_fsdp=True,
+        use_sp=True,
+        t5_cpu=False,
+        init_on_cpu=False,
+        convert_model_dtype=True,
+    )
+    try:
+        # reuse=False means the pipeline frees T5 and DiT cleanly at the
+        # end; the WanTI2V object becomes unusable afterwards but we
+        # throw it away here.
+        result = pipeline.generate(**kwargs, reuse=False)
+        return result
+    finally:
+        pipeline = None  # noqa: F841
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def _save_video_for_job(video_tensor, job: Job, config: Config) -> str:

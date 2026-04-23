@@ -46,32 +46,18 @@ def _init_distributed() -> tuple[int, int, int]:
     return rank, world_size, local_rank
 
 
-def _load_pipeline(config: config_module.Config):
-    """Construct WanTI2V on every rank (FSDP+Ulysses needs all ranks)."""
-    from wan import configs as wan_configs
-    from wan.textimage2video import WanTI2V
-
-    cfg = wan_configs.WAN_CONFIGS["ti2v-5B"]
-    # We DO enable FSDP sharding + Ulysses-4 (matches measured best config).
-    pipeline = WanTI2V(
-        config=cfg,
-        checkpoint_dir=config.ckpt_dir,
-        device_id=int(os.environ.get("LOCAL_RANK", 0)),
-        rank=dist.get_rank(),
-        t5_fsdp=False,
-        dit_fsdp=True,
-        use_sp=True,
-        t5_cpu=False,
-        init_on_cpu=False,
-        convert_model_dtype=True,
-    )
-    return pipeline
+def _prewarm_cuda() -> None:
+    """Touch CUDA so the first request doesn't pay for context init."""
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    # Allocate + free a tiny tensor to trigger CUDA context creation.
+    _ = torch.zeros(1, device=f"cuda:{local_rank}")
+    del _
+    torch.cuda.empty_cache()
 
 
 def _run_rank0(
     config: config_module.Config,
     store: JobStore,
-    pipeline,
 ) -> None:
     video_base_url = os.environ.get(
         "WAN_DEMO_PUBLIC_URL", f"http://{config.host}:{config.port}"
@@ -91,7 +77,7 @@ def _run_rank0(
 
         # Start the worker loop as a background task.
         worker_task = asyncio.create_task(
-            worker_driver_loop(store, pipeline, config, video_base_url)
+            worker_driver_loop(store, config, video_base_url)
         )
 
         # Start uvicorn within the same event loop so the worker and
@@ -118,9 +104,9 @@ def _run_rank0(
     asyncio.run(main())
 
 
-def _run_other_rank(pipeline) -> None:
+def _run_other_rank() -> None:
     """Ranks 1..3: just participate in broadcasts + generation."""
-    worker_client_loop(pipeline)
+    worker_client_loop()
 
 
 def main() -> int:
@@ -134,39 +120,17 @@ def main() -> int:
         rank, world_size, local_rank,
     )
 
+    _prewarm_cuda()
+
     if rank == 0:
         config = config_module.load()
         os.makedirs(config.output_dir, exist_ok=True)
-    else:
-        config = None
-
-    log.info("loading WanTI2V pipeline on rank=%d", rank)
-    # All ranks must construct the pipeline; on non-rank-0, we need a
-    # minimal config — pull ckpt_dir from env directly since rank-0's
-    # Config isn't broadcast.
-    if rank != 0:
-        ckpt_dir = os.environ.get("WAN_DEMO_CKPT_DIR")
-        if not ckpt_dir:
-            raise RuntimeError(
-                "WAN_DEMO_CKPT_DIR must be set for all ranks"
-            )
-        # Build a minimal Config; only fields the pipeline needs matter.
-        config = config_module.Config(
-            host="", port=0, token="",
-            ckpt_dir=ckpt_dir,
-            output_dir=os.environ.get("WAN_DEMO_OUTPUT_DIR", "/tmp"),
-            max_queue=0, allow_private_callback=False,
-        )
-    pipeline = _load_pipeline(config)
-    log.info("pipeline loaded on rank=%d", rank)
-
-    if rank == 0:
         db_path = os.path.join(config.output_dir, "jobs.db")
         store = JobStore(db_path)
         log.info("rank 0 JobStore opened at %s", db_path)
-        _run_rank0(config, store, pipeline)
+        _run_rank0(config, store)
     else:
-        _run_other_rank(pipeline)
+        _run_other_rank()
 
     log.info("process exiting rank=%d", rank)
     dist.destroy_process_group()

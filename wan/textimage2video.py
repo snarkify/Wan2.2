@@ -398,7 +398,7 @@ class WanTI2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            if offload_model or self.init_on_cpu:
+            if offload_model or self.init_on_cpu or reuse:
                 dit_bytes = sum(
                     p.element_size() * p.numel()
                     for p in self.model.parameters()
@@ -451,6 +451,16 @@ class WanTI2V:
                     gc.collect()
                     torch.cuda.empty_cache()
                 record_memory("after_dit_free", reset_peak=True)
+            elif reuse:
+                # Move the FSDP-sharded DiT off the GPU so VAE decode has
+                # the full workspace. The shard (~2.4 GB/rank at bf16) is
+                # the difference between fitting 81f on a 24 GB 4090 and
+                # OOMing during VAE decode.
+                with trace_span("dit_offload"):
+                    self.model.to('cpu')
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                record_memory("after_dit_offload", reset_peak=True)
             if self.rank == 0:
                 with torch_profile_phase("vae_decode"):
                     videos = self.vae.decode(x0)
