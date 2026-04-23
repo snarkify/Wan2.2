@@ -189,7 +189,8 @@ class WanTI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 reuse=False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -252,7 +253,8 @@ class WanTI2V:
             guide_scale=guide_scale,
             n_prompt=n_prompt,
             seed=seed,
-            offload_model=offload_model)
+            offload_model=offload_model,
+            reuse=reuse)
 
     def t2v(self,
             input_prompt,
@@ -264,7 +266,8 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
-            offload_model=True):
+            offload_model=True,
+            reuse=False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -328,7 +331,12 @@ class WanTI2V:
             record_memory("after_text_encoding", reset_peak=True)
             if offload_model:
                 with trace_span("t5_free"):
-                    del self.text_encoder
+                    if reuse:
+                        # Keep the object; just move weights back to CPU so
+                        # the next request can reuse the loaded model.
+                        self.text_encoder.model.to('cpu')
+                    else:
+                        del self.text_encoder
                     gc.collect()
                     torch.cuda.empty_cache()
                 record_memory("after_t5_free", reset_peak=True)
@@ -436,7 +444,7 @@ class WanTI2V:
                     latents = [temp_x0.squeeze(0)]
             record_memory("after_diffusion_loop", reset_peak=True)
             x0 = latents
-            if offload_model:
+            if offload_model and not reuse:
                 with trace_span("dit_free"):
                     free_model(self.model)
                     self.model = None
