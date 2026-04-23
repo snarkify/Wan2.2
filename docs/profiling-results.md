@@ -256,3 +256,68 @@ To visualize over time, open `trace_rank0.json` in Perfetto — the `gpu_sampler
 - `gpu/mem_used_mb` comes from NVML and reports all resident memory on the physical GPU, including other processes. On a shared host this will be higher than the process-local figure from `record_memory`.
 - Under `CUDA_VISIBLE_DEVICES` the sampler resolves NVML handles by UUID (via `torch.cuda.get_device_properties(local_rank).uuid`) because `nvmlDeviceGetHandleByIndex` takes PHYSICAL indices and does not honour the visibility mask. Using `local_rank` directly would silently sample the wrong GPU.
 - By default only rank 0 samples, to avoid 4× redundant rows under DDP/FSDP. Set `WAN_PROFILE_GPU_SAMPLER_RANKS=all` to diagnose per-GPU imbalance (e.g. VAE decode on rank 0 only, Ulysses all-to-all skew).
+
+## NCCL collective stats
+
+`all_to_all` and `all_gather` from `wan/distributed/util.py` are wrapped with timing + byte tracking. Each call emits a `collective/<op>` CSV row with wall + GPU time and byte count; `flush()` appends aggregate `collective_total/<op>` and `collective_total/<op>_bytes` rows.
+
+**Example** (17-frame FSDP+Ulysses-4 run, rank 0):
+
+```
+collective_total/all_to_all       count=12000  wall=1023ms   gpu=12899ms   bytes=81.1 GB
+collective_total/all_gather       count=100    wall=12.5ms   gpu=23.2ms    bytes=338 MB
+```
+
+12.9 s of GPU time in all-to-all on rank 0 ≈ 17% of diffusion GPU time — a direct answer to "why is Ulysses only 1.6× speedup instead of 4×".
+
+One-liner:
+```bash
+awk -F, '$3 ~ /^collective_total\// {print}' $OUT/<run>/timing_rank0.csv
+```
+
+## Memory fragmentation, PCIe bytes, attention backend
+
+- **`memory_frag/<label>`** rows accompany every `memory/<label>` row. `wall_ms` = `reserved − allocated` (MB); `gpu_ms` = `reserved` (MB). Large values mean the caching allocator is holding freed blocks unreusable by the next alloc.
+- **`t5_to_gpu` / `dit_to_gpu` spans** carry a `bytes` metadata field in the trace JSON. Divide by `wall_ms` to get effective PCIe bandwidth. RTX 5090 PCIe 5.0 x16 tops out at ~63 GB/s.
+- **`env/attn_backend/<name>`** one-shot row records the attention path (`flash_attn_3`, `flash_attn_2`, or `sdpa`) selected at profile init.
+
+## CPU cProfile (opt-in)
+
+The scheduler loop is CPU-heavy (~100–500 ms wall per step, 1 ms GPU). To see what dominates, set `WAN_PROFILE_CPU_SCHEDULER=1` and rerun. Stats accumulate across all 50 `scheduler.step()` calls and dump to `<profile_dir>/cpu_scheduler_rank0.prof`.
+
+```bash
+WAN_PROFILE_CPU_SCHEDULER=1 python generate.py ...   # run with profiling
+python -m pstats $OUT/<run>/cpu_scheduler_rank0.prof \
+  -c 'sort cumulative' -c 'stats 15' -c quit
+```
+
+**Example** (UniPC on 17 frames, 50 steps, 4.8 s scheduler CPU total):
+- `multistep_uni_c_bh_update`: **2.48 s (51%)** — the UniPC corrector is the hotspot
+- `torch.tensor(...)` (247 calls): **2.33 s** — scalar-to-CUDA conversions inside UniPC, a clear optimization target
+
+Overhead: cProfile adds ~30–50% CPU time to the wrapped region. Don't leave it on for steady-state benchmarking. Any region can be profiled the same way — wrap it in `with cpu_profile("name"):` and enable via `WAN_PROFILE_CPU_NAME=1`.
+
+## Variance driver
+
+Wall numbers from a single run have ±5% noise (warmup, thermal, OS jitter). `scripts/profiling/variance_run.py` runs a command N times and reports mean ± std:
+
+```bash
+python scripts/profiling/variance_run.py \
+    --name fsdp_uly_81f --runs 3 --skip-first \
+    --out-root /workspace/profile_outputs \
+    -- \
+    torchrun --nproc_per_node=4 --master_port=29500 generate.py \
+      --task ti2v-5B --size '1280*704' --frame_num 81 \
+      --ckpt_dir /workspace/Wan2.2-TI2V-5B --offload_model True \
+      --dit_fsdp --ulysses_size 4 --prompt 'repro'
+```
+
+Output:
+```
+=== Aggregate ===
+  peak_mb     : 27123.4 ± 32.1 (n=2)
+  total_s     : 229.5 ± 1.4 (n=2)
+  diffusion_s : 131.2 ± 0.9 (n=2)
+```
+
+`--skip-first` discards run 0 as warmup (cache-cold, thermal low).
