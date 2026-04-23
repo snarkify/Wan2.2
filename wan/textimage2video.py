@@ -166,6 +166,8 @@ class WanTI2V:
             dist.barrier()
 
         if dit_fsdp:
+            if convert_model_dtype:
+                model.to(self.param_dtype)
             model = shard_fn(model)
         else:
             if convert_model_dtype:
