@@ -243,6 +243,161 @@ def create_app(
     async def debug_memory():
         return _debug_memory()
 
+    # ---- POST /v1/debug/force_gc ----
+    # Triggers gc.collect + empty_cache + ipc_collect + clearCublasWorkspaces
+    # on every rank via broadcast. Returns rank-0 before/after for quick
+    # visibility into whether leaks are recoverable at the Python+allocator
+    # level vs stuck in CUDA libraries.
+    @app.post(
+        "/v1/debug/force_gc",
+        dependencies=[Depends(require_bearer)],
+    )
+    async def debug_force_gc():
+        from server.worker import broadcast_force_gc
+        return broadcast_force_gc()
+
+    # ---- GET /v1/debug/allocations ----
+    # Dump torch.cuda.memory._snapshot() for rank 0 — returns the list
+    # of live allocations with sizes, so we can see WHAT is leaked.
+    @app.get(
+        "/v1/debug/allocations",
+        dependencies=[Depends(require_bearer)],
+    )
+    async def debug_allocations():
+        import torch
+        out: dict[str, Any] = {}
+        try:
+            snap = torch.cuda.memory._snapshot()
+            # Filter to actually-allocated blocks only (state="active_allocated").
+            allocs = []
+            for seg in snap.get("segments", []):
+                if seg.get("device") != 0:
+                    continue
+                for blk in seg.get("blocks", []):
+                    if blk.get("state") == "active_allocated":
+                        allocs.append({
+                            "size_mb": blk["size"] // (1024 * 1024),
+                            "size_bytes": blk["size"],
+                            "segment_total_mb": seg["total_size"] // (1024 * 1024),
+                            "segment_pool": seg.get("segment_pool_id"),
+                        })
+            out["rank0_active_allocations"] = allocs
+            out["rank0_active_count"] = len(allocs)
+            out["rank0_active_total_mb"] = sum(a["size_mb"] for a in allocs)
+            # Segment summary: all segments on device 0 regardless of state.
+            segs = [
+                {
+                    "total_mb": s["total_size"] // (1024 * 1024),
+                    "allocated_mb": s.get("allocated_size", 0) // (1024 * 1024),
+                    "active_mb": s.get("active_size", 0) // (1024 * 1024),
+                    "stream": s.get("stream"),
+                    "num_blocks": len(s.get("blocks", [])),
+                    "pool": s.get("segment_pool_id"),
+                    "segment_type": s.get("segment_type"),
+                }
+                for s in snap.get("segments", [])
+                if s.get("device") == 0
+            ]
+            out["rank0_segments"] = segs
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    # ---- POST /v1/debug/start_history ----
+    # Start recording allocation stack traces (rank 0 only). After this,
+    # every torch.cuda allocation/free records a Python frame list on
+    # the block. Call this BEFORE enqueueing the job you want to trace.
+    # Overhead: measurable, but fine for a single diagnostic run.
+    @app.post(
+        "/v1/debug/start_history",
+        dependencies=[Depends(require_bearer)],
+    )
+    async def debug_start_history():
+        import torch
+        try:
+            torch.cuda.memory._record_memory_history(
+                max_entries=100_000,
+                context="all",
+                stacks="python",
+            )
+            return {"recording": True}
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    # ---- POST /v1/debug/stop_history ----
+    @app.post(
+        "/v1/debug/stop_history",
+        dependencies=[Depends(require_bearer)],
+    )
+    async def debug_stop_history():
+        import torch
+        try:
+            torch.cuda.memory._record_memory_history(enabled=None)
+            return {"recording": False}
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    # ---- GET /v1/debug/dump_snapshot ----
+    # Returns the *frames* (Python stacks) for every active_allocated
+    # block on rank 0. Requires /v1/debug/start_history to have been
+    # called before the allocation happened. The 'frames' list is the
+    # call stack where the block was allocated — read it top-to-bottom
+    # to find the line that constructed the tensor.
+    @app.get(
+        "/v1/debug/dump_snapshot",
+        dependencies=[Depends(require_bearer)],
+    )
+    async def debug_dump_snapshot():
+        import torch
+        out: dict[str, Any] = {}
+        try:
+            snap = torch.cuda.memory._snapshot()
+            blocks = []
+            for seg in snap.get("segments", []):
+                if seg.get("device") != 0:
+                    continue
+                for blk in seg.get("blocks", []):
+                    if blk.get("state") != "active_allocated":
+                        continue
+                    frames = blk.get("frames") or blk.get("frame") or []
+                    # frames is a list of dicts: {filename, name, line}
+                    fmt = [
+                        f"{f.get('filename','?')}:{f.get('line','?')} in {f.get('name','?')}"
+                        for f in frames
+                    ]
+                    blocks.append({
+                        "size_mb": blk["size"] // (1024 * 1024),
+                        "size_bytes": blk["size"],
+                        "segment_total_mb": seg["total_size"] // (1024 * 1024),
+                        "stack": fmt,
+                    })
+            out["rank0_blocks"] = blocks
+            # Also include device_traces — ordered alloc/free events —
+            # truncated to last N events for the 180-ish MB size range.
+            traces = []
+            for dev_traces in snap.get("device_traces", [])[:1]:
+                for ev in dev_traces[-500:]:
+                    sz = ev.get("size", 0)
+                    # Focus on sizes near our 180 MB target and other >= 1 MB.
+                    if sz >= 1024 * 1024:
+                        frames = ev.get("frames") or []
+                        fmt = [
+                            f"{f.get('filename','?')}:{f.get('line','?')} in {f.get('name','?')}"
+                            for f in frames[:10]
+                        ]
+                        traces.append({
+                            "action": ev.get("action"),
+                            "size_mb": sz // (1024 * 1024),
+                            "size_bytes": sz,
+                            "addr": ev.get("addr"),
+                            "stream": ev.get("stream"),
+                            "stack_top": fmt[:5],
+                        })
+            out["rank0_recent_traces"] = traces
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
     return app
 
 
@@ -338,6 +493,13 @@ def _debug_memory() -> dict[str, Any]:
             "nvml_used_mb": (total_b - free_b) // (1024 * 1024),
             "nvml_free_mb": free_b // (1024 * 1024),
             "nvml_total_mb": total_b // (1024 * 1024),
+            # The gap between nvml.used and (torch.reserved + ~ 600 MB
+            # baseline CUDA context) is "non-torch" memory: NCCL comm
+            # buffers, cuBLAS/cuDNN/flash_attn workspaces, kernel code
+            # cache. This is what the caching allocator can never free.
+            "non_torch_mb": (
+                (total_b - free_b) // (1024 * 1024) - reserved_mb
+            ),
         }
         # All devices free/used from NVML (cross-process signal).
         dev_info = []
@@ -349,16 +511,28 @@ def _debug_memory() -> dict[str, Any]:
                 "free_mb": f // (1024 * 1024),
             })
         out["nvml_all"] = dev_info
-        # Allocator segment summary (rank 0).
+        # FULL memory_stats dict (rank 0) — helps pin down which pool /
+        # counter grows across requests. Keys suffixed .current tell us
+        # the live state; .peak tracks high-water-mark since the last
+        # reset_peak_memory_stats(). Bytes converted to MB.
         try:
             stats = torch.cuda.memory_stats(local_rank)
-            out["rank0_segments"] = {
-                "active_segments_all_current": stats.get("segment.all.current"),
-                "active_segments_large_pool": stats.get("segment.large_pool.current"),
-                "active_segments_small_pool": stats.get("segment.small_pool.current"),
-                "allocator_alloc_requests": stats.get("allocation.all.allocated"),
-                "oom_observed_count": stats.get("num_ooms", 0),
-            }
+            interesting = {}
+            for k, v in stats.items():
+                if isinstance(v, int):
+                    if any(k.startswith(p) for p in (
+                        "allocated_bytes", "reserved_bytes", "active_bytes",
+                        "inactive_split_bytes", "requested_bytes",
+                    )):
+                        interesting[k + "_mb"] = v // (1024 * 1024)
+                    elif any(k.startswith(p) for p in (
+                        "segment.", "active.", "allocation.",
+                        "num_alloc_retries", "num_ooms", "num_sync_all_streams",
+                        "num_device_alloc", "num_device_free",
+                        "oversize_allocations", "oversize_segments",
+                    )):
+                        interesting[k] = v
+            out["rank0_memory_stats"] = interesting
         except Exception:
             pass
     except Exception as e:

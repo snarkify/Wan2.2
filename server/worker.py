@@ -69,27 +69,29 @@ async def worker_driver_loop(
         log.info("worker: picking up job=%s prompt=%r", job.id, job.prompt[:80])
         await store.mark_running(job.id)
 
-        msg = {"op": "generate", "kwargs": _build_kwargs(job), "ckpt_dir": config.ckpt_dir}
-        video_tensor = None
+        # Pre-compute the save path so the tensor never has to be
+        # returned from the executor — save happens inside _build_and_run.
+        save_path = os.path.join(config.output_dir, job.id, "video.mp4")
+        msg = {
+            "op": "generate",
+            "kwargs": _build_kwargs(job),
+            "ckpt_dir": config.ckpt_dir,
+            "save_path": save_path,
+        }
         try:
             _broadcast(msg)
-            # Run the actual generation on rank 0's thread pool so the
-            # asyncio loop stays responsive to HTTP and health checks.
-            # We construct and destroy the pipeline inside the executor
-            # so nothing stays resident between requests.
-            video_tensor = await loop.run_in_executor(
-                None, _build_and_run, msg["ckpt_dir"], msg["kwargs"]
+            # The executor returns only the path (a short string), so
+            # nothing large crosses the asyncio / ThreadPoolExecutor
+            # boundary and gets pinned by the Future's result slot.
+            returned_path = await loop.run_in_executor(
+                None, _build_and_run,
+                msg["ckpt_dir"], msg["kwargs"], save_path,
             )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             log.exception("worker: job=%s generation failed", job.id)
-            # Best-effort cleanup so the next request isn't starved by
-            # leftover tensors from a mid-decode OOM. Drop the partial
-            # video tensor reference explicitly; the outer local would
-            # otherwise pin it until the next successful reassignment.
             try:
                 import gc as _gc
-                video_tensor = None  # noqa: F841
                 _gc.collect()
                 torch.cuda.empty_cache()
                 _mem_snapshot("driver_after_exception_cleanup")
@@ -104,37 +106,30 @@ async def worker_driver_loop(
             )
             continue
 
-        # Write the video to disk. rank 0 has the tensor; other ranks returned None.
-        try:
-            video_path = await loop.run_in_executor(
-                None, _save_video_for_job, video_tensor, job, config
-            )
-            await store.mark_done(job.id, video_path)
-            job.status = "done"
-            job.video_path = video_path
-            job.finished_at = time.time()
-            log.info("worker: job=%s done path=%s", job.id, video_path)
-        except Exception as e:
-            err = f"save_video: {type(e).__name__}: {e}"
-            log.exception("worker: job=%s save failed", job.id)
+        if returned_path is None:
+            err = "generate returned no path (rank 0 did not save)"
+            log.error("worker: job=%s %s", job.id, err)
             await store.mark_failed(job.id, err)
             job.status = "failed"
             job.error = err
             job.finished_at = time.time()
-        finally:
-            # Release the returned video tensor before looping to the next
-            # job. Without this the ~876 MB (81f, fp32, 1280x704) tensor
-            # stays bound to the outer local until the next successful
-            # reassignment — pushing 81f VAE decode over the 24 GB budget
-            # on the *next* request and causing mid-decode OOMs.
-            try:
-                import gc as _gc
-                video_tensor = None  # noqa: F841
-                _gc.collect()
-                torch.cuda.empty_cache()
-                _mem_snapshot("driver_after_save_cleanup")
-            except Exception:
-                pass
+        else:
+            await store.mark_done(job.id, returned_path)
+            job.status = "done"
+            job.video_path = returned_path
+            job.finished_at = time.time()
+            log.info("worker: job=%s done path=%s", job.id, returned_path)
+
+        # Best-effort post-job cleanup. Nothing tensor-shaped lives in
+        # the driver loop anymore, but an extra gc+empty_cache catches
+        # any stray cross-task references.
+        try:
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()
+            _mem_snapshot("driver_after_save_cleanup")
+        except Exception:
+            pass
 
         if job.callback_url:
             asyncio.create_task(
@@ -161,14 +156,77 @@ def worker_client_loop() -> None:
             return
         if op == "generate":
             try:
-                _build_and_run(msg["ckpt_dir"], msg["kwargs"])
+                # save_path is rank-0-only (ignored on clients since
+                # only rank 0 receives the VAE output tensor), but we
+                # pass it through for symmetry with the driver call.
+                _build_and_run(
+                    msg["ckpt_dir"], msg["kwargs"], msg.get("save_path")
+                )
             except Exception:
                 # On non-driver ranks, errors can't be reported back over
                 # the distributed group without breaking the next
                 # broadcast; log and continue (rank 0 will observe).
                 log.exception("worker_client: generate raised")
             continue
+        if op == "force_gc":
+            _force_gc("client")
+            continue
         log.warning("worker_client: unknown op=%r", op)
+
+
+def _force_gc(label: str) -> dict[str, int]:
+    """Aggressive memory reclaim; logs before/after, returns rank-0 stats."""
+    import gc as _gc
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+    before_alloc = torch.cuda.memory_allocated(local_rank) // (1024 * 1024)
+    before_reserved = torch.cuda.memory_reserved(local_rank) // (1024 * 1024)
+    before_free, before_total = torch.cuda.mem_get_info(local_rank)
+    before_nvml = (before_total - before_free) // (1024 * 1024)
+
+    _gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    try:
+        # Internal: clears cached cuBLAS workspaces (typically 50-300 MB
+        # per device). Bounded to the "matmul workspace config" size.
+        torch._C._cuda_clearCublasWorkspaces()
+    except Exception:
+        pass
+    _gc.collect()
+    torch.cuda.empty_cache()
+
+    after_alloc = torch.cuda.memory_allocated(local_rank) // (1024 * 1024)
+    after_reserved = torch.cuda.memory_reserved(local_rank) // (1024 * 1024)
+    after_free, _ = torch.cuda.mem_get_info(local_rank)
+    after_nvml = (before_total - after_free) // (1024 * 1024)
+
+    log.info(
+        "force_gc[%s] rank=%d alloc %d->%d MB | reserved %d->%d MB "
+        "| nvml.used %d->%d MB (delta=%d MB)",
+        label, rank, before_alloc, after_alloc, before_reserved, after_reserved,
+        before_nvml, after_nvml, before_nvml - after_nvml,
+    )
+    return {
+        "rank": rank,
+        "before_alloc_mb": before_alloc,
+        "after_alloc_mb": after_alloc,
+        "before_reserved_mb": before_reserved,
+        "after_reserved_mb": after_reserved,
+        "before_nvml_used_mb": before_nvml,
+        "after_nvml_used_mb": after_nvml,
+        "delta_nvml_mb": before_nvml - after_nvml,
+    }
+
+
+def broadcast_force_gc() -> dict[str, int]:
+    """Rank-0-only entrypoint: broadcasts a force_gc op to clients and runs
+    the same locally, returning rank 0's stats."""
+    _broadcast({"op": "force_gc"})
+    return _force_gc("driver")
 
 
 def broadcast_shutdown() -> None:
@@ -244,10 +302,22 @@ def _teardown_pipeline(pipeline) -> None:
             setattr(pipeline, attr, None)
 
 
-def _build_and_run(ckpt_dir: str, kwargs: dict[str, Any]):
-    """Construct a fresh WanTI2V, run one generation, let GC destroy it.
+def _build_and_run(
+    ckpt_dir: str,
+    kwargs: dict[str, Any],
+    save_path: Optional[str] = None,
+) -> Optional[str]:
+    """Construct a fresh WanTI2V, run one generation, save the video, let GC destroy it.
 
-    Called from all ranks. Returns the tensor on rank 0, None elsewhere.
+    IMPORTANT: the video tensor is saved to disk INSIDE this function, before
+    the function returns. If the tensor crosses the ``loop.run_in_executor``
+    boundary (e.g. returned to the asyncio task), the ``concurrent.futures.Future``
+    internally pins it — measured empirically as a 180 MB leak per job on
+    rank 0 from `torch.cuda.memory._snapshot()`. Saving inline and returning
+    only the path string closes that leak.
+
+    Called from all ranks. Rank 0 saves + returns the path; other ranks
+    participate in the distributed collectives and return None.
     """
     import gc
     from wan import configs as wan_configs
@@ -274,13 +344,33 @@ def _build_and_run(ckpt_dir: str, kwargs: dict[str, Any]):
         convert_model_dtype=True,
     )
     _mem_snapshot("after_pipeline_ctor")
+    result_path: Optional[str] = None
     try:
         # reuse=False means the pipeline frees T5 and DiT cleanly at the
         # end; the WanTI2V object becomes unusable afterwards but we
         # throw it away here.
         result = pipeline.generate(**kwargs, reuse=False)
         _mem_snapshot("after_generate")
-        return result
+        # Save the video INSIDE this function (rank 0 only has the tensor).
+        if rank == 0 and save_path is not None and result is not None:
+            try:
+                from wan.utils.utils import save_video
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                save_video(
+                    tensor=result[None],
+                    save_file=save_path,
+                    fps=24,
+                    nrow=1,
+                    normalize=True,
+                    value_range=(-1, 1),
+                )
+                result_path = save_path
+            finally:
+                # Drop the tensor BEFORE returning so the executor's
+                # result slot doesn't pin it.
+                result = None  # noqa: F841
+        _mem_snapshot("after_save_inline")
+        return result_path
     finally:
         _teardown_pipeline(pipeline)
         pipeline = None  # noqa: F841
@@ -290,22 +380,3 @@ def _build_and_run(ckpt_dir: str, kwargs: dict[str, Any]):
         gc.collect()
         torch.cuda.empty_cache()
         _mem_snapshot("after_cleanup")
-
-
-def _save_video_for_job(video_tensor, job: Job, config: Config) -> str:
-    """Write the mp4 under OUTPUT_DIR/<job_id>/video.mp4; return that path."""
-    from wan.utils.utils import save_video
-
-    job_dir = os.path.join(config.output_dir, job.id)
-    os.makedirs(job_dir, exist_ok=True)
-    path = os.path.join(job_dir, "video.mp4")
-    # save_video expects (B, C, T, H, W); WanTI2V returns (C, T, H, W).
-    save_video(
-        tensor=video_tensor[None],
-        save_file=path,
-        fps=24,
-        nrow=1,
-        normalize=True,
-        value_range=(-1, 1),
-    )
-    return path
