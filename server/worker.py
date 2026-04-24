@@ -238,11 +238,24 @@ def broadcast_shutdown() -> None:
 def _build_kwargs(job: Job) -> dict[str, Any]:
     p = job.params
     size_w, size_h = _parse_size(p["size"])
+    # Resolve seed to a concrete value on rank 0 BEFORE the broadcast.
+    # If we left -1 in the message, each rank would independently pick a
+    # different random seed inside t2v(), producing different noise
+    # tensors across ranks. Ulysses then gathers slices from those
+    # inconsistent tensors, which shows up as noise in the middle of the
+    # video (rank 0 and rank 3 happen to match at the sequence edges).
+    # generate.py solves this via dist.broadcast_object_list; we do it
+    # by pinning the value here so the subsequent _broadcast carries the
+    # same seed to all ranks.
+    seed = int(p.get("seed", -1))
+    if seed < 0:
+        import random as _random
+        seed = _random.randint(0, 2**63 - 1)
     return {
         "input_prompt": job.prompt,
         "size": (size_w, size_h),
         "frame_num": int(p["frame_num"]),
-        "seed": int(p.get("seed", -1)),
+        "seed": seed,
         "sampling_steps": int(p.get("sampling_steps", 50)),
         "offload_model": True,
     }
