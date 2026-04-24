@@ -233,6 +233,16 @@ def create_app(
             gpu_free_mb=_gpu_free_mb(),
         )
 
+    # ---- GET /v1/debug/memory ----
+    # Rank-0 torch-allocator snapshot. Authenticated because it's a
+    # diagnostic; cheap enough to call between jobs.
+    @app.get(
+        "/v1/debug/memory",
+        dependencies=[Depends(require_bearer)],
+    )
+    async def debug_memory():
+        return _debug_memory()
+
     return app
 
 
@@ -307,3 +317,50 @@ def _gpu_free_mb() -> list[int]:
         return out
     except Exception:
         return []
+
+
+def _debug_memory() -> dict[str, Any]:
+    """Rank-0 torch allocator + nvml snapshot. Used to diagnose across-request leaks."""
+    import torch
+    out: dict[str, Any] = {}
+    try:
+        local_rank = 0
+        alloc_mb = torch.cuda.memory_allocated(local_rank) // (1024 * 1024)
+        reserved_mb = torch.cuda.memory_reserved(local_rank) // (1024 * 1024)
+        peak_alloc_mb = torch.cuda.max_memory_allocated(local_rank) // (1024 * 1024)
+        peak_reserved_mb = torch.cuda.max_memory_reserved(local_rank) // (1024 * 1024)
+        free_b, total_b = torch.cuda.mem_get_info(local_rank)
+        out["rank0_torch"] = {
+            "allocated_mb": alloc_mb,
+            "reserved_mb": reserved_mb,
+            "peak_allocated_mb": peak_alloc_mb,
+            "peak_reserved_mb": peak_reserved_mb,
+            "nvml_used_mb": (total_b - free_b) // (1024 * 1024),
+            "nvml_free_mb": free_b // (1024 * 1024),
+            "nvml_total_mb": total_b // (1024 * 1024),
+        }
+        # All devices free/used from NVML (cross-process signal).
+        dev_info = []
+        for i in range(torch.cuda.device_count()):
+            f, t = torch.cuda.mem_get_info(i)
+            dev_info.append({
+                "device": i,
+                "used_mb": (t - f) // (1024 * 1024),
+                "free_mb": f // (1024 * 1024),
+            })
+        out["nvml_all"] = dev_info
+        # Allocator segment summary (rank 0).
+        try:
+            stats = torch.cuda.memory_stats(local_rank)
+            out["rank0_segments"] = {
+                "active_segments_all_current": stats.get("segment.all.current"),
+                "active_segments_large_pool": stats.get("segment.large_pool.current"),
+                "active_segments_small_pool": stats.get("segment.small_pool.current"),
+                "allocator_alloc_requests": stats.get("allocation.all.allocated"),
+                "oom_observed_count": stats.get("num_ooms", 0),
+            }
+        except Exception:
+            pass
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out

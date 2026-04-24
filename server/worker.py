@@ -70,6 +70,7 @@ async def worker_driver_loop(
         await store.mark_running(job.id)
 
         msg = {"op": "generate", "kwargs": _build_kwargs(job), "ckpt_dir": config.ckpt_dir}
+        video_tensor = None
         try:
             _broadcast(msg)
             # Run the actual generation on rank 0's thread pool so the
@@ -83,11 +84,15 @@ async def worker_driver_loop(
             err = f"{type(e).__name__}: {e}"
             log.exception("worker: job=%s generation failed", job.id)
             # Best-effort cleanup so the next request isn't starved by
-            # leftover tensors from a mid-decode OOM.
+            # leftover tensors from a mid-decode OOM. Drop the partial
+            # video tensor reference explicitly; the outer local would
+            # otherwise pin it until the next successful reassignment.
             try:
                 import gc as _gc
+                video_tensor = None  # noqa: F841
                 _gc.collect()
                 torch.cuda.empty_cache()
+                _mem_snapshot("driver_after_exception_cleanup")
             except Exception:
                 pass
             await store.mark_failed(job.id, err)
@@ -116,6 +121,20 @@ async def worker_driver_loop(
             job.status = "failed"
             job.error = err
             job.finished_at = time.time()
+        finally:
+            # Release the returned video tensor before looping to the next
+            # job. Without this the ~876 MB (81f, fp32, 1280x704) tensor
+            # stays bound to the outer local until the next successful
+            # reassignment — pushing 81f VAE decode over the 24 GB budget
+            # on the *next* request and causing mid-decode OOMs.
+            try:
+                import gc as _gc
+                video_tensor = None  # noqa: F841
+                _gc.collect()
+                torch.cuda.empty_cache()
+                _mem_snapshot("driver_after_save_cleanup")
+            except Exception:
+                pass
 
         if job.callback_url:
             asyncio.create_task(
@@ -177,6 +196,54 @@ def _parse_size(s: str) -> tuple[int, int]:
     return int(w), int(h)
 
 
+def _mem_snapshot(label: str) -> None:
+    """Log torch + nvml memory so we can spot across-request accumulation."""
+    try:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        rank = int(os.environ.get("RANK", 0))
+        alloc = torch.cuda.memory_allocated(local_rank) // (1024 * 1024)
+        reserved = torch.cuda.memory_reserved(local_rank) // (1024 * 1024)
+        max_alloc = torch.cuda.max_memory_allocated(local_rank) // (1024 * 1024)
+        max_reserved = torch.cuda.max_memory_reserved(local_rank) // (1024 * 1024)
+        # nvml per-device free/total as a ground truth, independent of the
+        # torch allocator (catches NCCL buffers / cuBLAS workspaces that
+        # torch doesn't account for).
+        free_b, total_b = torch.cuda.mem_get_info(local_rank)
+        used_mb = (total_b - free_b) // (1024 * 1024)
+        log.info(
+            "mem[%s] rank=%d torch.alloc=%dMB reserved=%dMB peak_alloc=%dMB peak_reserved=%dMB nvml.used=%dMB",
+            label, rank, alloc, reserved, max_alloc, max_reserved, used_mb,
+        )
+    except Exception:
+        log.exception("mem[%s] snapshot failed", label)
+
+
+def _teardown_pipeline(pipeline) -> None:
+    """Drop every attribute that might hold a GPU allocation.
+
+    t2v(reuse=False) already `del`s text_encoder and calls free_model on
+    the DiT before returning, so in the happy path this is a no-op. But
+    when generate() raises mid-way (e.g., OOM in VAE decode), the
+    pipeline still owns self.vae / self.model / self.text_encoder with
+    live CUDA storage. The FSDP wrapper also creates a reference cycle
+    via the sequence-parallel `model.forward = MethodType(..., model)`
+    monkey-patch, so a single gc.collect() is not enough — we null the
+    attributes explicitly to break the cycle before collecting.
+    """
+    for attr in ("vae", "text_encoder", "model"):
+        if hasattr(pipeline, attr):
+            obj = getattr(pipeline, attr)
+            if obj is not None:
+                # Break FSDP's `model.forward -> MethodType(fn, model)` cycle
+                # by dropping the bound method before dropping the module.
+                if hasattr(obj, "forward") and hasattr(obj.forward, "__self__"):
+                    try:
+                        del obj.forward
+                    except (AttributeError, TypeError):
+                        pass
+            setattr(pipeline, attr, None)
+
+
 def _build_and_run(ckpt_dir: str, kwargs: dict[str, Any]):
     """Construct a fresh WanTI2V, run one generation, let GC destroy it.
 
@@ -190,6 +257,10 @@ def _build_and_run(ckpt_dir: str, kwargs: dict[str, Any]):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     rank = int(os.environ.get("RANK", 0))
 
+    _mem_snapshot("enter_build_and_run")
+    # Reset peak so we can read a fresh high-water-mark per request.
+    torch.cuda.reset_peak_memory_stats(local_rank)
+
     pipeline = WanTI2V(
         config=cfg,
         checkpoint_dir=ckpt_dir,
@@ -202,16 +273,23 @@ def _build_and_run(ckpt_dir: str, kwargs: dict[str, Any]):
         init_on_cpu=False,
         convert_model_dtype=True,
     )
+    _mem_snapshot("after_pipeline_ctor")
     try:
         # reuse=False means the pipeline frees T5 and DiT cleanly at the
         # end; the WanTI2V object becomes unusable afterwards but we
         # throw it away here.
         result = pipeline.generate(**kwargs, reuse=False)
+        _mem_snapshot("after_generate")
         return result
     finally:
+        _teardown_pipeline(pipeline)
         pipeline = None  # noqa: F841
+        # Two passes: the first collects the pipeline + wrapper modules,
+        # the second collects anything they were keeping alive via cycles.
+        gc.collect()
         gc.collect()
         torch.cuda.empty_cache()
+        _mem_snapshot("after_cleanup")
 
 
 def _save_video_for_job(video_tensor, job: Job, config: Config) -> str:

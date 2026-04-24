@@ -468,6 +468,15 @@ class WanTI2V:
 
         del noise, latents
         del sample_scheduler
+        # In the non-reuse path, the pipeline object is thrown away by
+        # the caller. Drop the VAE weights (~2.8 GB fp32) before the
+        # last dist.barrier so we don't keep them alive longer than
+        # necessary. Non-rank-0 ranks never loaded the decoder activations
+        # but still hold the VAE weights.
+        if not reuse:
+            del self.vae
+            gc.collect()
+            torch.cuda.empty_cache()
         if dist.is_initialized():
             dist.barrier()
 
