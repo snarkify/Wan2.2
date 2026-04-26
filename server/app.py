@@ -233,6 +233,53 @@ def create_app(
             gpu_free_mb=_gpu_free_mb(),
         )
 
+    # ---- POST /v1/slack/callback ----
+    # Receives our own demo-API callback (same bearer token) and posts
+    # the result to Slack. OpenClaw submits with
+    # `callback_url=<this server>/v1/slack/callback` and
+    # `callback_metadata={channel, user, thread_ts}` so we know where
+    # to post.
+    @app.post(
+        "/v1/slack/callback",
+        dependencies=[Depends(require_bearer)],
+    )
+    async def slack_callback(payload: dict):
+        from server import slack as slack_mod
+        meta = payload.get("metadata") or {}
+        channel = meta.get("channel")
+        user = meta.get("user") or ""
+        thread_ts = meta.get("thread_ts")
+        if not channel:
+            raise HTTPException(
+                status_code=400,
+                detail="metadata.channel required (supply in callback_metadata)",
+            )
+        # Resolve the video path via the job store (avoids re-downloading
+        # our own output over HTTP).
+        job_id = payload.get("job_id")
+        video_path = None
+        if job_id:
+            job = await store.get(job_id)
+            if job is not None:
+                video_path = job.video_path
+        result = await slack_mod.post_video_result(
+            channel=channel,
+            user=user,
+            thread_ts=thread_ts,
+            prompt=payload.get("prompt", "") or "",
+            video_path=video_path if payload.get("status") == "done" else None,
+            error=payload.get("error") if payload.get("status") != "done" else None,
+        )
+        # Surface Slack failures as 5xx so the demo-API retry / callback_status
+        # machinery doesn't declare success when Slack rejected the upload
+        # (e.g. bot-not-in-channel -> channel_not_found).
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=502,
+                detail={"slack_error": result},
+            )
+        return result
+
     # ---- GET /v1/debug/memory ----
     # Rank-0 torch-allocator snapshot. Authenticated because it's a
     # diagnostic; cheap enough to call between jobs.
