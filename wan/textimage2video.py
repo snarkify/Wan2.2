@@ -16,6 +16,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
 
+from .distributed.fp8_quant import quantize_wan_blocks_to_fp8
 from .distributed.fsdp import free_model, shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
@@ -165,13 +166,42 @@ class WanTI2V:
         if dist.is_initialized():
             dist.barrier()
 
+        # WAN_DEMO_QUANT=fp8 enables fp8_e4m3fn weights + torch._scaled_mm
+        # for transformer-block Linears. Default bf16. See
+        # wan/distributed/fp8_quant.py for the conversion + forward patch.
+        quant_mode = os.environ.get("WAN_DEMO_QUANT", "bf16").lower()
+        if quant_mode not in ("bf16", "fp8"):
+            raise ValueError(
+                f"WAN_DEMO_QUANT must be 'bf16' or 'fp8', got {quant_mode!r}"
+            )
+        rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
+        if rank0:
+            logging.info(f"[WAN_DEMO_QUANT] mode={quant_mode}")
+
         if dit_fsdp:
             if convert_model_dtype:
                 model.to(self.param_dtype)
-            model = shard_fn(model)
+            if quant_mode == "fp8":
+                # Cast block Linears to fp8 BEFORE FSDP wraps. FSDP's
+                # auto_wrap_policy wraps each model.blocks[i] as its own
+                # unit; the Linears we just touched live inside those
+                # units. Drop MixedPrecision so FSDP doesn't cast the
+                # fp8 weights back to bf16 in forward. Also disable
+                # sync_module_states because NCCL fp8 broadcast support
+                # is patchy; quantization is deterministic on identical
+                # bf16 inputs, so all ranks produce identical fp8
+                # weights without sync.
+                quantize_wan_blocks_to_fp8(model)
+                model = shard_fn(model, param_dtype=None,
+                                 reduce_dtype=None, buffer_dtype=None,
+                                 sync_module_states=False)
+            else:
+                model = shard_fn(model)
         else:
             if convert_model_dtype:
                 model.to(self.param_dtype)
+            if quant_mode == "fp8":
+                quantize_wan_blocks_to_fp8(model)
             if not self.init_on_cpu:
                 model.to(self.device)
 

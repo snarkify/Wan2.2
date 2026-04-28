@@ -20,16 +20,24 @@ def shard_model(
     sync_module_states=True,
     use_lora=False
 ):
+    # Pass mixed_precision=None when ALL three dtypes are None. This is
+    # the fp8 path: FSDP must NOT auto-cast our fp8_e4m3fn weights back
+    # to bf16 in forward. Caller pre-casts non-fp8 params to bf16.
+    if param_dtype is None and reduce_dtype is None and buffer_dtype is None:
+        mp = None
+    else:
+        mp = MixedPrecision(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            buffer_dtype=buffer_dtype,
+        )
     model = FSDP(
         module=model,
         process_group=process_group,
         sharding_strategy=sharding_strategy,
         auto_wrap_policy=partial(
             lambda_auto_wrap_policy, lambda_fn=lambda m: m in model.blocks),
-        mixed_precision=MixedPrecision(
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-            buffer_dtype=buffer_dtype),
+        mixed_precision=mp,
         device_id=device_id,
         sync_module_states=sync_module_states,
         use_orig_params=True if use_lora else False)
