@@ -321,3 +321,187 @@ Output:
 ```
 
 `--skip-first` discards run 0 as warmup (cache-cold, thermal low).
+
+---
+
+# Demo Server Architecture Investigation — gpu6 (4× RTX 4090, 24 GB, PCIe-PHB, no NVLink)
+
+The demo server originally inherited the Wan2.2 reference codebase's 4-GPU FSDP+Ulysses path. On gpu6's hardware (consumer 4090s, no NVLink, all GPU↔GPU comm goes through the CPU host bridge), this path is **net negative** for the 5B model. This section captures the investigation that overturned it and the validated single-GPU + warm + fp8 path that's now ~2.25× faster.
+
+## TL;DR — gpu6 paths
+
+| Path | 81f wall time | Per-step | Δ vs old prod |
+|---|---:|---:|---:|
+| Demo 4-GPU FSDP+Ulysses bf16 (old prod) | 649 s | 10.30 s | — |
+| Demo 1-GPU bf16 (just `--nproc_per_node=1`) | 414 s | 5.55 s | −36% |
+| **Demo 1-GPU fp8 warm (current prod)** | **293 s warm / 382 s cold** | **5.76 s** | **−55%** |
+| ComfyUI 1-GPU bf16 warm (reference) | 291 s | 5.80 s | — |
+| ComfyUI 1-GPU fp8_fast warm (reference) | 259 s | 5.20 s | — |
+
+Demo 1-GPU per-step (5.55 s) ≈ ComfyUI 1-GPU per-step (5.80 s). The pipeline is fine; the parallelism strategy was the regression.
+
+## The hardware mismatch
+
+```
+nvidia-smi topo -m on gpu6:
+       GPU0   GPU1   GPU2   GPU3
+GPU0    X    PHB    NODE   NODE
+GPU1   PHB    X     NODE   NODE
+GPU2   NODE  NODE    X     PHB
+GPU3   NODE  NODE   PHB     X
+
+NVLink: empty (4090 is consumer; no NVLink support)
+PCIe gen.current=1 idle, gen.max=4 (ramps under load)
+```
+
+**PHB** = PCIe Host Bridge (CPU). Every GPU↔GPU NCCL collective makes a round-trip through the CPU. Realistic NCCL aggregate ~5–10 GB/s on this topology vs ~900 GB/s on NVSwitch-equipped servers (H100/A100 SXM) where the upstream Wan2.2 code was designed.
+
+## Why FSDP+Ulysses is net-negative for the 5B model on this hardware
+
+Per inference (50 steps × CFG 2× = 100 forwards), the 4-GPU path does:
+
+- **3000 FSDP all-gathers** (30 transformer blocks × 100 forwards) reconstructing the full ~167 MB block weights on each rank
+- **12,000 Ulysses all-to-alls** (4 per attention block × 30 blocks × 100 forwards)
+
+Each collective is a sync point and PCIe round-trip. With ~100 ms aggregate per-block on PHB-PCIe, that's hundreds of seconds of pure comm. The 4-way compute speedup from sequence parallelism (~1.5–2× realistic) does not pay for the comm tax.
+
+Reference codebase pays this tax happily because (a) the 14B model literally doesn't fit on 1 GPU, and (b) NVLink-class hardware makes collectives essentially free. Neither premise holds for the 5B on consumer 4090s.
+
+## fp8 attempts on the demo server
+
+**Attempt 1: fp8 + FSDP1 (failed).** Naive quantization of all 300 `nn.Linear` modules (4.9 B params → fp8) before FSDP1 wrapping. Failed at FSDP wrap with `ValueError: Must flatten tensors with uniform dtype`. FSDP1 flattens parameters per wrapped unit; our wrap policy wraps each transformer block as one unit; inside a block we have fp8 Linears + bf16 norms → mixed → fail.
+
+**Attempt 2: fp8 + 1-GPU + warm (worked).** With FSDP gone (world-size-1 short-circuit added to `_configure_model`), fp8 conversion runs cleanly. 3 back-to-back 81f generations stable at 287.7 / 288.7 / 288.1 s, peak 23.1 GB. Pipeline ctor 85.9 s one-time.
+
+The demo server's fp8 path is **storage-only** (weights cast to fp8_e4m3fn but matmul still bf16). Same gotcha as ComfyUI's `fp8_e4m3fn` vs `fp8_e4m3fn_fast` toggle — only `_fast` engages 4090 fp8 tensor cores via `torch._scaled_mm`. Storage-only fp8 saves 37% steady-state VRAM but no compute. The wall-clock win on the demo server came entirely from eliminating the ~85 s reload-per-request, *not* from fp8 acceleration.
+
+## Memory ceiling on 4090
+
+Single 4090, fp8 warm, 81f at 1280×704: **23.1 GB peak**. With `offload_model=True` (T5 to CPU after encode, DiT to CPU before VAE decode):
+
+- Resident steady-state: ~7.5 GB (DiT fp8 2.5 + VAE 0.5 + cached buffers)
+- Diffusion peak: ~15 GB (DiT on GPU + activations × CFG 2)
+- VAE decode peak: 23.1 GB
+
+A first run with `offload_model=False` OOMed at 22.5 GB allocated trying to alloc 218 MB in `rope_apply`. **`offload_model=True` is mandatory** for 81f on a single 4090.
+
+The 4090 OOMs at ~141 frames at 1280×704 (VAE decode peak hits 24 GB ceiling).
+
+## Validated production architecture
+
+`docs/demo-server.md` covers the full architecture. Summary:
+
+1. `--nproc_per_node=1` — drop FSDP, drop Ulysses
+2. Module-level `_PIPELINE` singleton in `server/worker.py` — one ctor at startup, reuse forever
+3. `WAN_DEMO_QUANT=fp8` default (storage-only on 4090)
+4. `offload_model=True` — mandatory for 24 GB headroom
+5. Drop the rank>0 worker loop when world_size=1
+
+Result: 288 s/job vs 649 s today. 2.25× speedup. Frees 3 GPUs for parallel jobs (run 4 instances for 4× concurrency).
+
+---
+
+# Cross-platform: H100 80GB single-GPU vs RTX 4090
+
+After the demo-server refactor landed, we benchmarked the same pipeline on a vast.ai H100 80GB SXM-class instance to characterize the 4090→H100 gap and the headroom H100 unlocks for longer videos.
+
+## All-config benchmark — 81 frames @ 1280×704, 50 steps, warm
+
+| Backend | Hardware | Wall time | Per-step | Frames/s | Real-time factor* |
+|---|---|---:|---:|---:|---:|
+| **ComfyUI fp8_e4m3fn_fast** | **1× H100 80GB** | **84.3 s** | 1.69 s | **0.961** | **25.0×** |
+| Demo server fp8 warm | 1× H100 80GB | 93.4 s | 1.87 s | 0.868 | 27.7× |
+| ComfyUI bf16 | 1× H100 80GB | 90.1 s | 1.80 s | 0.900 | 26.7× |
+| ComfyUI fp8_e4m3fn (storage) | 1× H100 80GB | 90.3 s | 1.81 s | 0.897 | 26.8× |
+| Demo server bf16 warm | 1× H100 80GB | 102.3 s | 2.07 s | 0.792 | 30.3× |
+| ComfyUI fp8_e4m3fn_fast | 1× 4090 24GB | 259.0 s | 5.20 s | 0.313 | 76.7× |
+| Demo server fp8 warm | 1× 4090 24GB | 293.0 s | 5.76 s | 0.276 | 86.8× |
+| ComfyUI bf16 | 1× 4090 24GB | 290.8 s | 5.80 s | 0.278 | 86.2× |
+| ComfyUI fp8_e4m3fn (storage) | 1× 4090 24GB | 288.7 s | — | 0.281 | 85.6× |
+| Demo 1-GPU bf16 (cold) | 1× 4090 24GB | 414.0 s | 5.55 s | 0.196 | 122.7× |
+| Demo 4-GPU FSDP+Ulysses bf16 | 4× 4090 24GB | 649.4 s | 10.30 s | 0.125 | 192.3× |
+
+\* Real-time factor = wall_time / video_duration (3.375 s @ 24 fps source for 81 frames)
+
+## Cross-platform speedup ratios
+
+| Path | 4090 → H100 |
+|---|---:|
+| ComfyUI fp8_fast | 259 → 84 s = **3.07×** |
+| ComfyUI bf16 | 291 → 90 s = **3.23×** |
+| Demo fp8 warm | 293 → 93 s = **3.14×** |
+| Demo bf16 warm | (≈291) → 102 s = **2.85×** |
+
+Consistent **~3×** across configs. Notable: the per-step ratio matches the wall-time ratio, so this is real per-step compute speedup, not init/load amortization.
+
+## H100-specific observations
+
+**1. The "fp8 win" gap shrinks on H100.** On 4090: fp8_fast vs bf16 saves 32 s (-11%). On H100: only 6 s (-6.4%). H100 is bandwidth-limited at bf16, so speeding up matmul (fp8 tensor cores) doesn't help proportionally.
+
+**2. Storage-only fp8 ties bf16 on H100 too** (90.1 vs 90.3 s) — same conclusion as 4090. Storage-only fp8 saves memory but not time.
+
+**3. Pipeline ctor is faster on H100** — 50–58 s vs 86 s on 4090 (~40% faster) thanks to faster storage and HBM bandwidth.
+
+**4. Demo server vs ComfyUI gap also shrinks on H100** — 9 s gap (93 vs 84) vs 34 s on 4090. Reload tax / offload differences matter less when everything is fast.
+
+## Frame-count headroom on H100
+
+| Frames | Wall time | Per-step | Peak alloc | Notes |
+|---:|---:|---:|---:|---|
+| 81 | 93 s | 1.87 s | 24.0 GB | baseline |
+| 401 | 805 s | 15.2 s | 33.0 GB | first probe — succeeded |
+| **721** | **2154 s** | **43.1 s** | **53.2 GB** | **30 s of video at 24 fps** |
+
+Memory scales sub-linearly with frame count: ~28 MB/frame extra peak alloc beyond baseline. By that scaling H100 could plausibly fit 1500+ frames before hitting the 80 GB ceiling. **But see the next section — the model can't usefully generate that long.**
+
+## ComfyUI install on H100 — gotchas
+
+If reproducing this bench, three traps to avoid:
+
+1. **kijai's `WanVideoModelLoader` requires single-file DiT.** Wan2.2 ships sharded; merge in-memory with `safetensors.torch.load_file()` + `.clone()` *before* `os.remove()` of the shards (mmap retains the inode on `safe_open`-style readers, blocking actual disk free until process exit). On a small `/workspace`, do `os.remove()` *before* the merged write to make room for the output.
+
+2. **VHS_VideoCombine** node lives in a separate repo (`Kosinkadink/ComfyUI-VideoHelperSuite`). The bench script's workflow uses it for mp4 output. Easy miss, fast fail with `missing_node_type`.
+
+3. **flash_attn 2** has no prebuilt wheel for torch 2.11+cu128+py312. The Wan2.2 codebase calls `flash_attention()` directly which `assert FLASH_ATTN_2_AVAILABLE`s. The wrapping `attention()` has a clean SDPA fallback but isn't on the hot path. Patch `flash_attention()` to fall back to `torch.nn.functional.scaled_dot_product_attention` when neither FA2 nor FA3 is available — PyTorch 2.11's bundled flash backend is competitive on H100. See the diff in `wan/modules/attention.py` under the world-size-1 fixes for an example.
+
+---
+
+# The training-horizon wall — why long Wan2.2 videos look static
+
+We pushed the H100's frame-count headroom (memory permits) toward a 30-second clip and hit a model-quality wall, not a memory wall.
+
+## The 30-second probe
+
+Same setup as the 81/401-frame benches (fp8 warm, 1280×704, 50 steps, seed 42), `--frames 721` (=`4×180+1` ≈ 30.04 s @ 24 fps):
+
+- Wall time 2154 s, peak alloc 53 GB, per-step 43 s — pipeline executed cleanly.
+- **But the output is essentially static.** Frames 0, 360, 720 show the same composition with only minute frame-to-frame differences.
+- A multi-scene narrative prompt (5 scenes: office desk → paper airplane → drawing → rain → bright park) collapsed into a single visual that loosely resembles the *last* described scene, with no scene cuts or transitions.
+- Frame 0 also shows OOD denoising artifacts (pixelated glitches in one half of the image).
+
+## Two stacked failures
+
+**Failure 1 — past training distribution.** Wan2.2 TI2V-5B's `ti2v_5B.frame_num = 121` config is the trained/recommended max (set in `wan/configs/wan_ti2v_5B.py`). 721 frames is **~6× past training horizon**. The model "stretches" — produces minute frame-to-frame variations but no real scene evolution. The pixelated artifact is classic out-of-distribution denoising failure.
+
+**Failure 2 — multi-scene prompts don't work in any current text-to-video model.** Wan2.2 (and Sora, Veo, Cog…) treat the entire prompt as describing **one scene**, not a script with cuts. Markers like "Scene 1… Scene 2…" get averaged into a single visual setting; the most-emphasized or last-described scene typically dominates. Multi-scene narratives must be generated as separate clips and stitched.
+
+## Implications
+
+1. **The `MAX_FRAMES=141` cap on the demo server is doing real work**, not just being defensive. Beyond ~121 frames, output quality degrades sharply regardless of available memory. The cap should stay even on H100 deployments.
+
+2. **The H100's frame-count *memory* headroom does not translate into useful long-form generation.** 80 GB unlocks the *ability* to render 1000+ frames in a single pass; the *model* can't keep them dynamic.
+
+3. **For long-form output, three patterns work:**
+   - **Multi-clip stitching**: generate 5× ≤121-frame clips with separate single-scene prompts, cross-fade with ffmpeg. Same total wall-clock as one monolithic run, but with actual scene changes.
+   - **Single-scene continuous-motion at ≤121 frames**: rich continuous motion in one setting (camera dolly, weather change, slow object motion). The jellyfish prompt is closer to this pattern than the multi-scene dream prompt and the output reflects it.
+   - **i2v chaining** (Wan2.2 paper's recommended pattern for long videos): generate a 121-frame clip; use the last frame as image conditioning for the next clip's prompt; concatenate. Requires the i2v branch which is in the codebase but not wired to the demo server.
+
+## Concrete artifacts on H100
+
+`/workspace/Wan2.2/bench_artifacts/`:
+- `stats_h100_fp8.json`, `stats_h100_bf16.json` — 81f warm matrix
+- `stats_h100_401.json` — 401f probe (succeeded, 805 s, 33 GB peak)
+- `stats_h100_30s.json`, `stats_h100_30s_dream.json` — 721f / 30 s runs (jellyfish + multi-scene dream prompt)
+- `h100_30s_jelly/warm_fp8_gen1.mp4`, `h100_30s_dream/warm_fp8_gen1.mp4` — output mp4s
+- `h100_comfy_bench/runs.jsonl` — ComfyUI matrix bench (bf16 / fp8 / fp8_fast at 81f)
+
