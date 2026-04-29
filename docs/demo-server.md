@@ -108,13 +108,28 @@ steady-state. Raw artifacts on gpu6 at
 `bench_artifacts/stats_warm_fp8_v2.json` and
 `bench_artifacts/run_warm_fp8_v2.log`.
 
+Standalone bench (`scripts/bench_warm_fp8.py`, no HTTP server):
+
 | config                          | gen 1 | gen 2 | gen 3 | warm mean | peak alloc |
 |---------------------------------|------:|------:|------:|----------:|-----------:|
 | 1 GPU + fp8 + warm              | 288 s | 289 s | 288 s |   288 s   |   23.1 GB  |
 | 4 GPU + bf16 + reload-per-job   |       |       |       |   649 s   |            |
 
+End-to-end through the demo server (`POST /v1/generations` to
+`status=done`, three back-to-back requests):
+
+| job        | wall (s) | peak alloc | notes |
+|------------|---------:|-----------:|-------|
+| 1 (cold)   |    382   |  23.1 GB   | includes 86 s pipeline ctor + cold-kernel-compile |
+| 2 (warm)   |    293   |  23.1 GB   | warm singleton; peak unchanged from gen 1 |
+| 3 (warm)   |    293   |  23.1 GB   | identical to gen 2; no across-request drift |
+
 Pipeline constructor: 86 s (one-time, paid by the first job after
-server start). Steady-state per-step: 5.75 s/step.
+server start). Steady-state per-step: 5.02 s/step. After-cleanup
+allocator state was identical between job 1 and job 3 (2697 MB
+allocated, 3372 MB nvml.used) — the warm singleton holds T5 + VAE
+resident across requests as designed, and DiT cycles in/out via
+`offload_model=True` without leaking.
 
 The 4-GPU number is from the previous production path measured in
 `docs/profiling-results.md`. The speedup comes from three things
