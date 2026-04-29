@@ -5,3 +5,6 @@ tmp_examples*
 new_checkpoint*
 batch_test*
 nohup*
+.env
+.env.*
+!.env.example
