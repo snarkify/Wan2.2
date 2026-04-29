@@ -11,31 +11,54 @@ top of the script).
 ## Architecture
 
 ```
-torchrun --nproc_per_node=4 -m server.main   (single launch, persistent)
+torchrun --nproc_per_node=1 -m server.main   (single launch, persistent)
 │
-├── rank 0   FastAPI + uvicorn (port 8000) + asyncio job queue + worker loop
-│              accepts POST /v1/generations
-│              dispatches each job to all ranks via dist.broadcast_object_list
-│              writes mp4 to disk inside the executor
-│              fires callback to /v1/slack/callback (if requested)
-│
-└── ranks 1..3   idle in dist.broadcast_object_list waiting for the next job;
-                 participate in the diffusion forward (Ulysses-4 + FSDP).
+└── rank 0   FastAPI + uvicorn (port 8000) + asyncio job queue + worker loop
+              accepts POST /v1/generations
+              builds a WanTI2V singleton on first job (~86 s) and reuses
+              it for the lifetime of the process (warm path)
+              writes mp4 to disk inside the executor
+              fires callback to /v1/slack/callback (if requested)
 ```
+
+The default is now 1 GPU + warm pipeline + fp8. Set `WAN_DEMO_GPUS=4`
+to fall back to the legacy 4-GPU FSDP+Ulysses path (see "Why 1 GPU
+beat 4" below); when GPUS>1, ranks 1..N-1 sit in
+`server.worker.worker_client_loop` waiting for `dist.broadcast_object_list`
+broadcasts and participate in the diffusion forward.
 
 Choices that matter:
 
-- **Cross-rank dispatch via `dist.broadcast_object_list`**: zero new
-  dependencies, reuses the existing torch.distributed group that FSDP
-  and Ulysses already need. NCCL watchdog timeout bumped to 24 h via
-  `init_process_group(timeout=...)` and `TORCH_NCCL_ASYNC_ERROR_HANDLING=0`
-  so idle broadcasts between jobs don't kill the group.
-- **Reload pipeline per request**: each job constructs a fresh
-  `WanTI2V`, runs once, drops it. Tried `reuse=True` (keep models in
-  memory between jobs and shuffle to/from CPU) but FSDP's `to('cpu')`
-  doesn't release the FlatParameter storage on a 24 GB card, so it
-  OOMed every second job in VAE decode. Reload-per-request adds ~95 s
-  of model-load overhead — tolerable for an 11-minute job.
+- **1 GPU + warm pipeline (default)**: 288 s/job warm, 374 s for the
+  first job after server start. The 4-GPU FSDP+Ulysses path runs at
+  649 s/job — the diffusion forward gets faster with more GPUs but
+  per-job FSDP wrap/unflatten + cross-rank communication eats the win,
+  and FSDP's unsharded buffers leak across requests (forcing the old
+  reload-per-request workaround that paid 95 s of model-load every
+  job). With `WanTI2V.__init__`'s world-size-1 guard skipping the
+  FSDP wrap, we can keep the pipeline live across requests safely.
+  Net: 2.25× speedup vs the old default. See bench summary below.
+- **fp8 quantization (default)**: `WAN_DEMO_QUANT=fp8` casts every
+  transformer-block `nn.Linear` weight to `torch.float8_e4m3fn` and
+  replaces forward with `torch._scaled_mm`. Mirrors ComfyUI's
+  `fp8_e4m3fn_fast` path. ~11% per-step speedup on Ada (4090) tensor
+  cores. Set `WAN_DEMO_QUANT=bf16` to disable; the speedup is real but
+  fp8 is a lossy cast — visual quality is comparable to bf16 on the
+  prompts we tested but not byte-identical.
+- **Cross-rank dispatch via `dist.broadcast_object_list`** (used only
+  when `WAN_DEMO_GPUS>1`): zero new dependencies, reuses the existing
+  torch.distributed group that FSDP and Ulysses already need. NCCL
+  watchdog timeout bumped to 24 h via `init_process_group(timeout=...)`
+  and `TORCH_NCCL_ASYNC_ERROR_HANDLING=0` so idle broadcasts between
+  jobs don't kill the group.
+- **Module-level pipeline singleton in `server/worker.py`**: built
+  lazily on the first job, reused across all subsequent jobs. Pipeline
+  ownership lives in the worker module, not in `Config` or `JobStore`
+  — those are env state and job state respectively; the pipeline is
+  worker state. T5 still offloads to CPU after each encode (built-in
+  to `WanTI2V.generate`); DiT moves to CPU between requests via
+  `offload_model=True` so VAE decode has the 24 GB it needs for the
+  141-frame ceiling.
 - **SQLite-backed job store** in `WAN_DEMO_OUTPUT_DIR/jobs.db` so
   pending and completed jobs survive restarts. Startup reconciliation:
   in-flight `running` jobs become `failed("server restarted")` (and
@@ -69,8 +92,36 @@ Choices that matter:
 | `GET` | `/v1/debug/dump_snapshot` | Bearer | Active blocks with Python stack traces (needs history on first) |
 
 Frame counts are constrained to **`4n+1` in [5, 141]**; size is fixed
-to `1280*704`; `eta_seconds` follows `T(N) ≈ 443 + 2.68·N` measured on
-the 4090 box (see `docs/profiling-results.md`).
+to `1280*704`; `eta_seconds` follows `T(N) ≈ 191 + 1.20·N` warm (1 GPU
++ fp8) plus a one-time `+86 s` cold-start bonus while the singleton is
+still being built. The 141-frame ceiling holds at world=1: VAE decode
+is rank-0-only either way, so the OOM boundary doesn't move with GPU
+count.
+
+## Bench: 1-GPU + warm + fp8 vs. 4-GPU FSDP+Ulysses
+
+Single 4090 (gpu6), TI2V-5B, 81 frames, 1280×704, 50 steps,
+`offload_model=True`, prompt "A cat walking in a sunlit meadow", same
+seed. Three back-to-back generations from a single Python process so
+gen 1 covers cold-kernel-compile + warmup and gens 2–3 are warm
+steady-state. Raw artifacts on gpu6 at
+`bench_artifacts/stats_warm_fp8_v2.json` and
+`bench_artifacts/run_warm_fp8_v2.log`.
+
+| config                          | gen 1 | gen 2 | gen 3 | warm mean | peak alloc |
+|---------------------------------|------:|------:|------:|----------:|-----------:|
+| 1 GPU + fp8 + warm              | 288 s | 289 s | 288 s |   288 s   |   23.1 GB  |
+| 4 GPU + bf16 + reload-per-job   |       |       |       |   649 s   |            |
+
+Pipeline constructor: 86 s (one-time, paid by the first job after
+server start). Steady-state per-step: 5.75 s/step.
+
+The 4-GPU number is from the previous production path measured in
+`docs/profiling-results.md`. The speedup comes from three things
+stacking: skipping FSDP wrap/unflatten + MixedPrecision overhead at
+world=1, reusing the loaded pipeline across jobs, and fp8 `_scaled_mm`
+on the transformer blocks. fp8 alone bought ~11%; the rest is the
+warm + 1-GPU restructuring.
 
 ## Slack integration
 
@@ -254,6 +305,32 @@ Lesson reinforced: the user was right to push past the easy
 "acceptable for a demo, restart every 50 jobs" answer. The data was
 available all along (`torch.cuda.memory._snapshot` with `frames`)
 and the actual fix was 30 lines once we stopped guessing.
+
+### 9. The 4-GPU path was the wrong default
+
+Most of the bug history above (#5, #7, the per-request reload in #2)
+exists because we were running FSDP+Ulysses across 4 GPUs and paying
+the FSDP overhead for it. Once we benchmarked the 1-GPU path with a
+warm pipeline + fp8 on a single 4090, it landed at 288 s/job vs the
+4-GPU path's 649 s — 2.25× faster. The 4-GPU diffusion forward IS
+faster than 1-GPU per step, but per-job FSDP wrap/unflatten +
+cross-rank communication overwhelms the diffusion savings, and it's
+the FSDP wrap that creates all the across-request leak surface area
+in the first place.
+
+The world-size-1 guard in `wan/textimage2video.py::_configure_model`
+demotes `dit_fsdp` and `use_sp` to `False` when there's only one
+process. That removes the FSDP code path entirely (so the leaks in #5
+and #7 can't recur) and lets `server/worker.py` keep the pipeline
+alive across requests as a module-level singleton. The 4-GPU path is
+still reachable via `WAN_DEMO_GPUS=4` for anyone who wants it; the
+old reload-per-request behavior in #2 is the right call there.
+
+fp8 quantization (`WAN_DEMO_QUANT=fp8`, default) adds another ~11%
+on top via `torch._scaled_mm` on Ada tensor cores. fp8_e4m3fn weights
+survive the CPU↔GPU round-trip cleanly (validated across 3
+back-to-back gens with `offload_model=True` — peak alloc stays at
+23.1 GB, no drift), so it composes with the warm-singleton path.
 
 ## Branch layout
 

@@ -37,6 +37,13 @@ from server.jobstore import (
 log = logging.getLogger("server.app")
 
 
+def _pipeline_warm() -> bool:
+    """Tiny indirection so the ETA path doesn't import worker at module
+    load time (worker pulls torch + the WanTI2V module which is heavy)."""
+    from server.worker import is_pipeline_warm
+    return is_pipeline_warm()
+
+
 # ----- request / response models -----
 
 
@@ -145,7 +152,10 @@ def create_app(
             job_id=job.id,
             status=job.status,
             queue_position=position,
-            eta_seconds=config.eta_seconds(position, req.frame_num),
+            eta_seconds=config.eta_seconds(
+                position, req.frame_num,
+                pipeline_warm=_pipeline_warm(),
+            ),
         )
 
     # ---- GET /v1/generations/{id} ----

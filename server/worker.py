@@ -1,20 +1,37 @@
 """Cross-rank job dispatch.
 
-rank 0 drives the HTTP server + queue, and broadcasts each job to all
-ranks via torch.distributed. Ranks 1..3 live in worker_client_loop()
-waiting for broadcasts and calling the same pipeline.generate().
+This module owns the WanTI2V pipeline lifecycle. The pipeline is a
+**module-level singleton** (`_PIPELINE`), built lazily on the first job
+and reused across requests for the lifetime of the process. JobStore
+holds job state and Config holds env-var settings; the pipeline is
+genuinely worker-owned, so it lives here rather than being injected.
 
-A fresh WanTI2V pipeline is **constructed for every request**. We tried
-keeping a persistent pipeline with reuse=True (moving T5+DiT between
-CPU and GPU between requests), but .to('cpu') on an FSDP-wrapped model
-doesn't release the FlatParameter storage, so VAE decode OOMed on
-24 GB 4090s. Reloading per request adds ~95s of model-load overhead
-per job but is known-working (same path as the measured standalone
-runs in docs/profiling-results.md).
+Why a singleton (replaces the old per-request reload):
 
-Protocol (wrapped in a one-element list for broadcast_object_list):
+The original demo-server path constructed a fresh WanTI2V on every job
+because FSDP's `to('cpu')` between requests didn't release the
+FlatParameter storage on a 24 GB 4090 — the second job VAE-decode-OOMed.
+Reload-per-request added ~95 s of model-load to every job. With the
+1-GPU FSDP-bypass guard in `wan/textimage2video.py` (world_size==1
+demotes `dit_fsdp` to False), there's no FlatParameter to leak. We can
+keep the pipeline live and pay the 86 s constructor cost exactly once.
+
+Validated warm steady-state (bench_artifacts/stats_warm_fp8_v2.json,
+4090, 81 frames, 50 steps, fp8, offload_model=True):
+  gen 1: 287.7 s   gen 2: 288.7 s   gen 3: 288.1 s
+  peak alloc 23.1 GB stable, no across-request drift.
+
+torchrun protocol (preserved for runbook/script muscle memory): the
+launcher still wraps us with `torchrun --nproc_per_node=N`. At N=1 we
+init a degenerate 1-rank process group; non-driver ranks (when N>1) sit
+in `worker_client_loop` waiting for broadcasts, but production runs
+N=1 and that loop is dormant.
+
+Cross-rank protocol (only used when WAN_DEMO_GPUS>1, retained for the
+multi-GPU path):
     {"op": "generate", "kwargs": {...}}     # run a job
     {"op": "shutdown"}                       # clean exit
+    {"op": "force_gc"}                       # debug: gc + empty_cache
 """
 
 from __future__ import annotations
@@ -37,6 +54,17 @@ from server.jobstore import Job, JobStore
 log = logging.getLogger("server.worker")
 
 _DRIVER_RANK = 0
+
+# Module-level pipeline singleton. None until the first job triggers
+# `_get_or_build_pipeline`. Set once and reused for the lifetime of the
+# worker process. See module docstring for the rationale.
+_PIPELINE = None  # type: Optional["wan.textimage2video.WanTI2V"]
+
+
+def is_pipeline_warm() -> bool:
+    """True once the singleton has been built. Used by the ETA endpoint
+    to decide whether to charge callers for the one-time constructor."""
+    return _PIPELINE is not None
 
 
 def _broadcast(msg: dict[str, Any]) -> None:
@@ -70,7 +98,7 @@ async def worker_driver_loop(
         await store.mark_running(job.id)
 
         # Pre-compute the save path so the tensor never has to be
-        # returned from the executor — save happens inside _build_and_run.
+        # returned from the executor — save happens inside _run_job.
         save_path = os.path.join(config.output_dir, job.id, "video.mp4")
         msg = {
             "op": "generate",
@@ -79,12 +107,16 @@ async def worker_driver_loop(
             "save_path": save_path,
         }
         try:
-            _broadcast(msg)
+            # Only broadcast if there are other ranks listening. At
+            # world=1 the broadcast is harmless (collective is a no-op)
+            # but skipping it avoids the dist round-trip on the hot path.
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                _broadcast(msg)
             # The executor returns only the path (a short string), so
             # nothing large crosses the asyncio / ThreadPoolExecutor
             # boundary and gets pinned by the Future's result slot.
             returned_path = await loop.run_in_executor(
-                None, _build_and_run,
+                None, _run_job,
                 msg["ckpt_dir"], msg["kwargs"], save_path,
             )
         except Exception as e:
@@ -120,9 +152,10 @@ async def worker_driver_loop(
             job.finished_at = time.time()
             log.info("worker: job=%s done path=%s", job.id, returned_path)
 
-        # Best-effort post-job cleanup. Nothing tensor-shaped lives in
-        # the driver loop anymore, but an extra gc+empty_cache catches
-        # any stray cross-task references.
+        # Best-effort post-job cleanup. With the warm singleton we keep
+        # the pipeline alive across jobs; only stray temporaries get
+        # released here. The warm bench shows stable 23.1 GB peak alloc
+        # across consecutive gens, so this is mostly a defensive sweep.
         try:
             import gc as _gc
             _gc.collect()
@@ -138,10 +171,11 @@ async def worker_driver_loop(
 
 
 def worker_client_loop() -> None:
-    """Ranks 1..3: loop receiving broadcasts and participating in generation.
+    """Ranks 1..N-1: receive broadcasts and participate in generation.
 
-    Constructs a fresh pipeline per request (matches rank 0 behavior)
-    so FSDP/NCCL state is reset between jobs.
+    Dormant at production world=1 (only rank 0 exists). Retained for the
+    multi-GPU path — the singleton works the same across ranks because
+    every rank constructs its own pipeline lazily on first job.
     """
     log.info("worker client loop started on rank=%s", os.environ.get("RANK"))
     while True:
@@ -159,7 +193,7 @@ def worker_client_loop() -> None:
                 # save_path is rank-0-only (ignored on clients since
                 # only rank 0 receives the VAE output tensor), but we
                 # pass it through for symmetry with the driver call.
-                _build_and_run(
+                _run_job(
                     msg["ckpt_dir"], msg["kwargs"], msg.get("save_path")
                 )
             except Exception:
@@ -225,12 +259,14 @@ def _force_gc(label: str) -> dict[str, int]:
 def broadcast_force_gc() -> dict[str, int]:
     """Rank-0-only entrypoint: broadcasts a force_gc op to clients and runs
     the same locally, returning rank 0's stats."""
-    _broadcast({"op": "force_gc"})
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        _broadcast({"op": "force_gc"})
     return _force_gc("driver")
 
 
 def broadcast_shutdown() -> None:
-    _broadcast({"op": "shutdown"})
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        _broadcast({"op": "shutdown"})
 
 
 # ----- helpers -----
@@ -244,9 +280,8 @@ def _build_kwargs(job: Job) -> dict[str, Any]:
     # tensors across ranks. Ulysses then gathers slices from those
     # inconsistent tensors, which shows up as noise in the middle of the
     # video (rank 0 and rank 3 happen to match at the sequence edges).
-    # generate.py solves this via dist.broadcast_object_list; we do it
-    # by pinning the value here so the subsequent _broadcast carries the
-    # same seed to all ranks.
+    # Still load-bearing at world=1 too: Ulysses is off, but pinning a
+    # concrete seed gives us a reproducible value for the job record.
     seed = int(p.get("seed", -1))
     if seed < 0:
         import random as _random
@@ -289,81 +324,106 @@ def _mem_snapshot(label: str) -> None:
         log.exception("mem[%s] snapshot failed", label)
 
 
-def _teardown_pipeline(pipeline) -> None:
-    """Drop every attribute that might hold a GPU allocation.
+def _get_or_build_pipeline(ckpt_dir: str):
+    """Return the module-level WanTI2V singleton, building it on first call.
 
-    t2v(reuse=False) already `del`s text_encoder and calls free_model on
-    the DiT before returning, so in the happy path this is a no-op. But
-    when generate() raises mid-way (e.g., OOM in VAE decode), the
-    pipeline still owns self.vae / self.model / self.text_encoder with
-    live CUDA storage. The FSDP wrapper also creates a reference cycle
-    via the sequence-parallel `model.forward = MethodType(..., model)`
-    monkey-patch, so a single gc.collect() is not enough — we null the
-    attributes explicitly to break the cycle before collecting.
+    Construction is deferred to the first job rather than process start
+    so that `WAN_DEMO_QUANT` and `WAN_DEMO_CKPT_DIR` (read inside the
+    constructor) reflect any environment surfaced by the launch script,
+    and so that a server with zero traffic doesn't pay the 86 s
+    constructor cost it would never use.
+
+    At world=1 the pipeline auto-demotes dit_fsdp to False inside
+    `WanTI2V.__init__` (see wan/textimage2video.py world-size guard), so
+    there are no FSDP handles to leak between jobs.
     """
-    for attr in ("vae", "text_encoder", "model"):
-        if hasattr(pipeline, attr):
-            obj = getattr(pipeline, attr)
-            if obj is not None:
-                # Break FSDP's `model.forward -> MethodType(fn, model)` cycle
-                # by dropping the bound method before dropping the module.
-                if hasattr(obj, "forward") and hasattr(obj.forward, "__self__"):
-                    try:
-                        del obj.forward
-                    except (AttributeError, TypeError):
-                        pass
-            setattr(pipeline, attr, None)
+    global _PIPELINE
+    if _PIPELINE is not None:
+        return _PIPELINE
 
-
-def _build_and_run(
-    ckpt_dir: str,
-    kwargs: dict[str, Any],
-    save_path: Optional[str] = None,
-) -> Optional[str]:
-    """Construct a fresh WanTI2V, run one generation, save the video, let GC destroy it.
-
-    IMPORTANT: the video tensor is saved to disk INSIDE this function, before
-    the function returns. If the tensor crosses the ``loop.run_in_executor``
-    boundary (e.g. returned to the asyncio task), the ``concurrent.futures.Future``
-    internally pins it — measured empirically as a 180 MB leak per job on
-    rank 0 from `torch.cuda.memory._snapshot()`. Saving inline and returning
-    only the path string closes that leak.
-
-    Called from all ranks. Rank 0 saves + returns the path; other ranks
-    participate in the distributed collectives and return None.
-    """
-    import gc
     from wan import configs as wan_configs
     from wan.textimage2video import WanTI2V
 
     cfg = wan_configs.WAN_CONFIGS["ti2v-5B"]
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     rank = int(os.environ.get("RANK", 0))
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    _mem_snapshot("enter_build_and_run")
-    # Reset peak so we can read a fresh high-water-mark per request.
+    log.info(
+        "building pipeline singleton: rank=%d world=%d quant=%s ckpt=%s",
+        rank, world_size,
+        os.environ.get("WAN_DEMO_QUANT", "bf16"),
+        ckpt_dir,
+    )
     torch.cuda.reset_peak_memory_stats(local_rank)
+    t0 = time.perf_counter()
 
-    pipeline = WanTI2V(
+    use_fsdp = world_size > 1
+    use_sp = world_size > 1
+    _PIPELINE = WanTI2V(
         config=cfg,
         checkpoint_dir=ckpt_dir,
         device_id=local_rank,
         rank=rank,
+        # At world=1 these are both False; at world>1 we keep the
+        # original FSDP+Ulysses parallelism. The world-size guard in
+        # WanTI2V.__init__ would also demote dit_fsdp itself, but
+        # passing the right value here keeps logging honest.
         t5_fsdp=False,
-        dit_fsdp=True,
-        use_sp=True,
-        t5_cpu=False,
+        dit_fsdp=use_fsdp,
+        use_sp=use_sp,
+        t5_cpu=False,           # T5 must run on GPU
         init_on_cpu=False,
         convert_model_dtype=True,
     )
-    _mem_snapshot("after_pipeline_ctor")
+    elapsed = time.perf_counter() - t0
+    log.info("pipeline singleton built in %.2fs", elapsed)
+    _mem_snapshot("after_pipeline_build")
+    return _PIPELINE
+
+
+def _run_job(
+    ckpt_dir: str,
+    kwargs: dict[str, Any],
+    save_path: Optional[str] = None,
+) -> Optional[str]:
+    """Run one generation against the warm singleton, save to disk, return path.
+
+    The video tensor is saved to disk INSIDE this function, before the
+    function returns. If the tensor crosses the ``loop.run_in_executor``
+    boundary (e.g. returned to the asyncio task), the
+    ``concurrent.futures.Future`` internally pins it — measured
+    empirically as a 180 MB leak per job on rank 0 from
+    ``torch.cuda.memory._snapshot()``. Saving inline and returning only
+    the path string closes that leak.
+
+    Called from all ranks. Rank 0 saves + returns the path; other ranks
+    (when world>1) participate in the distributed collectives and
+    return None.
+    """
+    import gc
+
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    _mem_snapshot("enter_run_job")
+    # Reset peak so we can read a fresh high-water-mark per request.
+    torch.cuda.reset_peak_memory_stats(local_rank)
+
+    pipeline = _get_or_build_pipeline(ckpt_dir)
+
     result_path: Optional[str] = None
     try:
-        # reuse=False means the pipeline frees T5 and DiT cleanly at the
-        # end; the WanTI2V object becomes unusable afterwards but we
-        # throw it away here.
-        result = pipeline.generate(**kwargs, reuse=False)
+        # reuse=True keeps T5 + DiT loaded across calls — that is the
+        # whole point of the warm singleton. T5 still offloads to CPU
+        # after encode (built-in), and offload_model=True moves DiT to
+        # CPU after the diffusion loop so VAE decode has the 24 GB it
+        # needs for 81-frame jobs at 1280x704. Validated in
+        # bench_artifacts/stats_warm_fp8_v2.json: peak alloc stays at
+        # 23.1 GB across consecutive gens with this exact config.
+        result = pipeline.generate(**kwargs, reuse=True)
         _mem_snapshot("after_generate")
+
         # Save the video INSIDE this function (rank 0 only has the tensor).
         if rank == 0 and save_path is not None and result is not None:
             try:
@@ -385,11 +445,8 @@ def _build_and_run(
         _mem_snapshot("after_save_inline")
         return result_path
     finally:
-        _teardown_pipeline(pipeline)
-        pipeline = None  # noqa: F841
-        # Two passes: the first collects the pipeline + wrapper modules,
-        # the second collects anything they were keeping alive via cycles.
-        gc.collect()
+        # Defensive sweep. The pipeline is intentionally retained
+        # (singleton); we only collect any locals we may have created.
         gc.collect()
         torch.cuda.empty_cache()
         _mem_snapshot("after_cleanup")
