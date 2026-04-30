@@ -5,18 +5,19 @@ from dataclasses import dataclass
 
 
 # Timing formula for the warm 1-GPU + fp8 path on a single RTX 4090.
-# Calibrated against bench_artifacts/stats_warm_fp8_v2.json (N=81 -> 288 s
-# warm; first-job-of-process pays an extra 86 s for the pipeline
-# constructor — surfaced separately as _T_COLD_START_BONUS).
+# Calibrated against bench_artifacts/perf-path-b_20260430-030223_qfp8_aflash_c0_f81_s50_pathb-baseline-fp8.json
+# (N=81 -> 291 s warm mean across gen 2 + gen 3; first-job-of-process
+# pays an extra ~86 s for the pipeline constructor — surfaced separately
+# as _T_COLD_START_BONUS).
 #
 # Per-frame slope: at world=1 with fp8, the diffusion-step cost scales
 # linearly in frame count (sequence length). We have a single measured
-# point (N=81 -> 288 s) and use the 4-GPU formula's structure to back
-# out the split: subtract the constant per-job overhead (T5 encode +
-# VAE decode + scheduler init, ~191 s) leaving ~1.20 s/frame for the
-# 50-step diffusion loop. If we ever land a second N, refit.
+# point (N=81 -> 291 s) and hold the constant overhead at 191 s (T5
+# encode + VAE decode + scheduler init), leaving (291 - 191) / 81 = 1.235
+# s/frame for the 50-step diffusion loop. If we ever land a second N,
+# refit both constants.
 _T_OFFSET = 191.0
-_T_PER_FRAME = 1.20
+_T_PER_FRAME = 1.235
 
 # Extra time the first job of a fresh server process pays — the
 # WanTI2V pipeline constructor (T5 + VAE + DiT load + fp8 quant). After
