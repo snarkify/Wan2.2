@@ -201,6 +201,24 @@ class WanTI2V:
                 f"[WAN_DEMO_ATTN] mode={attn_mode_env} "
                 f"resolved={attn_backend} sage_available={SAGE_ATTN_AVAILABLE}"
             )
+            # Phase 3: surface the configured torch.compile mode at
+            # pipeline-init time. The actual compile is applied by the
+            # caller (server/worker.py or generate.py) after the
+            # constructor returns; this log line exists so a single
+            # tail of the demo-server log shows quant + attn + compile
+            # in one place. The mode is resolved here only for display
+            # — the helper resolves it again at apply time.
+            compile_env = os.environ.get("WAN_DEMO_COMPILE", "1")
+            compile_on = compile_env.strip().lower() in (
+                "1", "true", "yes", "on",
+            )
+            compile_mode_env = os.environ.get(
+                "WAN_DEMO_COMPILE_MODE", "default"
+            )
+            logging.info(
+                f"[WAN_DEMO_COMPILE] enabled={compile_on} "
+                f"mode={compile_mode_env}"
+            )
 
         # World-size=1 guard: FSDP with a single rank is a no-op for sharding
         # but still adds wrap/unflatten overhead and forces MixedPrecision.

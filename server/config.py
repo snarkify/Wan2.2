@@ -19,11 +19,23 @@ from dataclasses import dataclass
 _T_OFFSET = 191.0
 _T_PER_FRAME = 1.235
 
-# Extra time the first job of a fresh server process pays — the
-# WanTI2V pipeline constructor (T5 + VAE + DiT load + fp8 quant). After
-# the singleton is built, subsequent jobs are warm. Used to nudge the
-# ETA for the first queued job after a restart.
-_T_COLD_START_BONUS = 86.0
+# Extra time the first job of a fresh server process pays. With
+# WAN_DEMO_COMPILE=1 (Phase 3 default), this includes BOTH the WanTI2V
+# pipeline constructor (T5 + VAE + DiT load + fp8 quant ≈ 86 s) AND
+# the first-forward torch.compile cost (~270 s of Dynamo/Inductor work
+# captured the first time the DiT is invoked under compile).
+#
+# 360 s = 86 s constructor + ~270 s first-forward compile, calibrated
+# against Phase 3 acceptance budget (docs/path-b-acceptance.md §3-2:
+# first-job-of-process must be ≤ 480 s, i.e. ≤ ~270 s on top of the
+# steady-state ≤ 215 s warm wall). After the first job completes, the
+# singleton is both built and compiled; every subsequent job is warm.
+#
+# If `WAN_DEMO_COMPILE=0` is ever set in production, this constant
+# overestimates the cold bonus by ~270 s — that just yields a more
+# pessimistic ETA, never an under-estimate, so we accept the conservatism
+# rather than complicate the formula.
+_T_COLD_START_BONUS = 360.0
 
 # Frame-count ceiling measured on 4x RTX 4090 (see plan / profiling-results).
 # 141 is the last successful value before VAE decode OOMs at 1280x704.
@@ -45,6 +57,15 @@ class Config:
     # Fixed demo defaults
     size: str = "1280*704"
     sampling_steps: int = 50
+    # Path B Phase 3: torch.compile on the warm DiT singleton. Default
+    # True — compile is the largest remaining lever after sage attention
+    # and is numerically near-identical to eager (gating PSNR ≥ 40 dB
+    # vs Phase 2). Set `WAN_DEMO_COMPILE=0` to disable for debugging.
+    compile_enabled: bool = True
+    # Compile mode passed through to torch.compile. `default` is safest
+    # with fp8 _scaled_mm; `reduce-overhead` trades ~1 GB extra for
+    # CUDA-graph capture but is risky on a 22.2 GB peak / 24 GB 4090.
+    compile_mode: str = "default"
 
     def eta_seconds(
         self,
@@ -75,7 +96,29 @@ def _require(var: str) -> str:
     return val
 
 
+def _parse_bool(env_name: str, default: bool) -> bool:
+    """Parse a boolean env var. Accepts 0/1/true/false/yes/no (any case).
+    Empty / unset → default. Anything else → ValueError so misconfig
+    surfaces at startup."""
+    raw = os.environ.get(env_name)
+    if raw is None or raw.strip() == "":
+        return default
+    v = raw.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(
+        f"{env_name} must be 0/1/true/false/yes/no, got {raw!r}"
+    )
+
+
 def load() -> Config:
+    # Lazy import: compile_util imports torch, which we don't want to
+    # force on the cold path of `from server.config import Config` from
+    # tests that just want to look at the dataclass shape.
+    from wan.distributed.compile_util import resolve_compile_mode
+
     return Config(
         host=os.environ.get("WAN_DEMO_HOST", "0.0.0.0"),
         port=int(os.environ.get("WAN_DEMO_PORT", "8000")),
@@ -86,4 +129,8 @@ def load() -> Config:
         allow_private_callback=os.environ.get(
             "WAN_DEMO_ALLOW_PRIVATE_CALLBACK", "0"
         ) == "1",
+        compile_enabled=_parse_bool("WAN_DEMO_COMPILE", default=True),
+        compile_mode=resolve_compile_mode(
+            os.environ.get("WAN_DEMO_COMPILE_MODE")
+        ),
     )

@@ -333,6 +333,13 @@ def _get_or_build_pipeline(ckpt_dir: str):
     and so that a server with zero traffic doesn't pay the 86 s
     constructor cost it would never use.
 
+    Path B Phase 3: after construction, we apply `torch.compile` to the
+    DiT attribute(s) when `WAN_DEMO_COMPILE=1` (default). The compile
+    rebinds `pipeline.model` in place, so the singleton slot still
+    holds a fully-functional pipeline; subsequent calls hit the
+    compiled forward. The first generation pays the one-time Dynamo +
+    Inductor capture cost (~270 s); gens 2+ are warm steady-state.
+
     At world=1 the pipeline auto-demotes dit_fsdp to False inside
     `WanTI2V.__init__` (see wan/textimage2video.py world-size guard), so
     there are no FSDP handles to leak between jobs.
@@ -342,6 +349,7 @@ def _get_or_build_pipeline(ckpt_dir: str):
         return _PIPELINE
 
     from wan import configs as wan_configs
+    from wan.distributed.compile_util import compile_dit
     from wan.textimage2video import WanTI2V
 
     cfg = wan_configs.WAN_CONFIGS["ti2v-5B"]
@@ -379,6 +387,30 @@ def _get_or_build_pipeline(ckpt_dir: str):
     elapsed = time.perf_counter() - t0
     log.info("pipeline singleton built in %.2fs", elapsed)
     _mem_snapshot("after_pipeline_build")
+
+    # Path B Phase 3: torch.compile the DiT once, on the warm singleton.
+    # Read flags from env directly (not via Config) — the worker is
+    # invoked across rank processes and the Config dataclass lives only
+    # on rank 0; env is the lowest-common-denominator config channel
+    # that all ranks see identically.
+    compile_enabled = os.environ.get("WAN_DEMO_COMPILE", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    if compile_enabled:
+        from wan.distributed.compile_util import resolve_compile_mode
+        mode = resolve_compile_mode(os.environ.get("WAN_DEMO_COMPILE_MODE"))
+        log.info("[WAN_DEMO_COMPILE] applying torch.compile mode=%s", mode)
+        t1 = time.perf_counter()
+        compiled = compile_dit(_PIPELINE, mode=mode, enabled=True)
+        log.info(
+            "[WAN_DEMO_COMPILE] setup done in %.3fs (compile cost is paid "
+            "lazily on first forward), compiled=%s",
+            time.perf_counter() - t1, compiled,
+        )
+        _mem_snapshot("after_compile_setup")
+    else:
+        log.info("[WAN_DEMO_COMPILE] disabled (WAN_DEMO_COMPILE=0)")
+
     return _PIPELINE
 
 

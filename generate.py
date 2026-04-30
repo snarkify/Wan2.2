@@ -368,23 +368,15 @@ def generate(args):
         logging.info("torch.compile enabled")
 
     def _compile_dit(pipeline):
-        """Apply torch.compile to DiT model(s) on a pipeline."""
-        if not args.compile_model:
-            return
-        import wan.profiling as _prof
-        compiled_any = False
-        for attr in ("model", "noise_model",
-                      "low_noise_model", "high_noise_model"):
-            if hasattr(pipeline, attr):
-                m = getattr(pipeline, attr)
-                compiled = torch.compile(m)
-                setattr(pipeline, attr, compiled)
-                compiled_any = True
-                logging.info(f"Compiled {attr}")
-        # Tell the profiling framework to skip CUDA events for
-        # spans that wrap compiled forward calls.
-        if compiled_any:
-            _prof._compile_active = True
+        """Apply torch.compile to DiT model(s) on a pipeline.
+
+        Thin wrapper around `wan.distributed.compile_util.compile_dit`
+        — the helper is shared with the demo server worker so both
+        entrypoints stay in lockstep on candidate attribute names and
+        compile-mode handling.
+        """
+        from wan.distributed.compile_util import compile_dit as _do_compile
+        _do_compile(pipeline, mode="default", enabled=args.compile_model)
 
     if args.use_prompt_extend:
         if args.prompt_extend_method == "dashscope":

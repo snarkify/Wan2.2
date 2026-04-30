@@ -15,11 +15,19 @@ phases land sage and compile flags, the matrix expands without
 re-authoring the harness — only the `_known_flags_for_phase` table and
 the validator-call sites need to learn the new values.
 
-Phase 1 (this commit):
+Phase 1:
   - WAN_DEMO_QUANT in {bf16, fp8, fp8_fast} -> all accepted
   - WAN_DEMO_QUANT outside that set         -> ValueError
   - WAN_DEMO_ATTN, WAN_DEMO_COMPILE         -> not yet a validator,
     so any value is accepted (we just record the future surface).
+
+Phase 3 (this commit adds):
+  - WAN_DEMO_COMPILE in {0, 1, true, false, yes, no} -> all accepted
+  - WAN_DEMO_COMPILE outside that set       -> ValueError raised by
+    server/config.py:_parse_bool
+  - WAN_DEMO_COMPILE_MODE in {default, reduce-overhead, max-autotune}
+    -> accepted; anything else -> ValueError (raised by
+    wan.distributed.compile_util.resolve_compile_mode)
 """
 
 from __future__ import annotations
@@ -42,7 +50,15 @@ _PHASE1_QUANT_INVALID = ["int8", "fp16", "", "FP8", "fp8-fast", "BF16 "]
 # importable, else flash). "flash" remains the canonical fallback.
 # Compile is still Phase-3 territory.
 _PHASE1_ATTN_VALID = ["auto", "sage", "flash"]
-_PHASE1_COMPILE_VALID = ["0"]
+# Phase 3 wires WAN_DEMO_COMPILE into server/config.py via _parse_bool;
+# anything _parse_bool accepts is shippable. Both "0" and "1" must
+# round-trip through Config.compile_enabled correctly.
+_PHASE3_COMPILE_VALID = ["0", "1", "true", "false", "yes", "no"]
+_PHASE3_COMPILE_INVALID = ["maybe", "compile", "2", "FP8", "  "]
+# Compile mode accepts the three torch.compile literals plus empty/None
+# (interpreted as "default"). Anything else raises.
+_PHASE3_COMPILE_MODE_VALID = ["default", "reduce-overhead", "max-autotune"]
+_PHASE3_COMPILE_MODE_INVALID = ["aggressive", "fast", "DEFAULT ", "max_autotune"]
 
 
 @contextmanager
@@ -140,14 +156,15 @@ def test_quant_validator_rejects_unknown_values(bad: str):
 
 @pytest.mark.parametrize("quant", _PHASE1_QUANT_VALID)
 @pytest.mark.parametrize("attn", _PHASE1_ATTN_VALID)
-@pytest.mark.parametrize("compile_flag", _PHASE1_COMPILE_VALID)
-def test_full_flag_matrix_phase1(quant: str, attn: str, compile_flag: str):
-    """Every (quant, attn, compile) combination shipped at Phase 1 must
-    pass the config-validator surfaces. Phase 1 has only a quant
-    validator; attn and compile are forward-compatible env vars that
-    the bench harness already reads (see scripts/bench_warm_fp8.py) but
-    no live code branches on. Test asserts no validator raises and the
-    Config dataclass loads cleanly."""
+@pytest.mark.parametrize("compile_flag", _PHASE3_COMPILE_VALID)
+def test_full_flag_matrix(quant: str, attn: str, compile_flag: str):
+    """Every (quant, attn, compile) combination shipped through Phase 3
+    must pass the config-validator surfaces. The matrix grew at Phase 3:
+    WAN_DEMO_COMPILE now drives `Config.compile_enabled` and is parsed
+    by `server.config._parse_bool`. We assert here that every legal
+    string round-trips through Config without raising and that the
+    boolean ends up correct.
+    """
     with _env_overrides(
         WAN_DEMO_QUANT=quant,
         WAN_DEMO_ATTN=attn,
@@ -170,11 +187,138 @@ def test_full_flag_matrix_phase1(quant: str, attn: str, compile_flag: str):
         assert cfg.ckpt_dir == "/tmp/test-ckpt"
         assert cfg.output_dir == "/tmp/test-output"
 
-        # 3. ETA function returns a finite positive number for a
+        # 3. compile_enabled correctly parsed.
+        expected_on = compile_flag.lower() in ("1", "true", "yes", "on")
+        assert cfg.compile_enabled is expected_on, (
+            f"compile_flag={compile_flag!r} expected_on={expected_on} "
+            f"got cfg.compile_enabled={cfg.compile_enabled}"
+        )
+
+        # 4. ETA function returns a finite positive number for a
         # representative job (queue_position=0, frame_num=81).
         eta = cfg.eta_seconds(queue_position=0, frame_num=81, pipeline_warm=True)
         assert eta > 0
         assert eta == pytest.approx(191.0 + 1.235 * 81, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 compile-flag dispatch tests. Exercise the boolean parser and
+# the compile-mode resolver directly. Neither path actually invokes
+# torch.compile (that requires CUDA + the warm pipeline), but both
+# validators run on import and must reject misconfiguration eagerly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("compile_flag", _PHASE3_COMPILE_VALID)
+def test_compile_flag_accepts_known_values(compile_flag: str):
+    """Every value in `_PHASE3_COMPILE_VALID` must parse to a bool
+    without raising. The expected truthiness is the obvious mapping.
+    """
+    with _env_overrides(
+        WAN_DEMO_COMPILE=compile_flag,
+        WAN_DEMO_TOKEN="t", WAN_DEMO_CKPT_DIR="/tmp/c",
+        WAN_DEMO_OUTPUT_DIR="/tmp/o",
+    ):
+        from server import config as server_config
+        importlib.reload(server_config)
+        cfg = server_config.load()
+        expected = compile_flag.lower() in ("1", "true", "yes", "on")
+        assert cfg.compile_enabled is expected
+
+
+@pytest.mark.parametrize("compile_flag", _PHASE3_COMPILE_INVALID)
+def test_compile_flag_rejects_unknown_values(compile_flag: str):
+    with _env_overrides(
+        WAN_DEMO_COMPILE=compile_flag,
+        WAN_DEMO_TOKEN="t", WAN_DEMO_CKPT_DIR="/tmp/c",
+        WAN_DEMO_OUTPUT_DIR="/tmp/o",
+    ):
+        from server import config as server_config
+        importlib.reload(server_config)
+        # Empty/whitespace returns the default (True), so don't expect
+        # ValueError for those. The parser deliberately treats them as
+        # "unset" rather than as misconfiguration.
+        if compile_flag.strip() == "":
+            cfg = server_config.load()
+            assert cfg.compile_enabled is True  # default
+            return
+        with pytest.raises(ValueError, match=r"WAN_DEMO_COMPILE"):
+            server_config.load()
+
+
+def test_compile_flag_default_is_enabled():
+    """User explicitly asked for compile-on by default in Phase 3."""
+    with _env_overrides(
+        WAN_DEMO_COMPILE=None,
+        WAN_DEMO_TOKEN="t", WAN_DEMO_CKPT_DIR="/tmp/c",
+        WAN_DEMO_OUTPUT_DIR="/tmp/o",
+    ):
+        from server import config as server_config
+        importlib.reload(server_config)
+        cfg = server_config.load()
+        assert cfg.compile_enabled is True
+
+
+@pytest.mark.parametrize("mode", _PHASE3_COMPILE_MODE_VALID)
+def test_compile_mode_accepts_known_values(mode: str):
+    from wan.distributed.compile_util import resolve_compile_mode
+    assert resolve_compile_mode(mode) == mode
+
+
+def test_compile_mode_default_when_unset():
+    from wan.distributed.compile_util import resolve_compile_mode
+    assert resolve_compile_mode(None) == "default"
+    assert resolve_compile_mode("") == "default"
+    assert resolve_compile_mode("   ") == "default"
+
+
+@pytest.mark.parametrize("bad", _PHASE3_COMPILE_MODE_INVALID)
+def test_compile_mode_rejects_unknown_values(bad: str):
+    from wan.distributed.compile_util import resolve_compile_mode
+    if bad.strip().lower() in ("default", "reduce-overhead", "max-autotune"):
+        pytest.skip(f"{bad!r} normalizes to a valid value")
+    with pytest.raises(ValueError, match=r"WAN_DEMO_COMPILE_MODE"):
+        resolve_compile_mode(bad)
+
+
+def test_compile_dit_no_op_when_disabled():
+    """`compile_dit(..., enabled=False)` returns [] without touching
+    the pipeline. This is the path taken when WAN_DEMO_COMPILE=0."""
+    from wan.distributed.compile_util import compile_dit
+
+    class FakePipeline:
+        def __init__(self):
+            self.model = "sentinel-model"
+            self.noise_model = "sentinel-noise"
+
+    p = FakePipeline()
+    result = compile_dit(p, enabled=False)
+    assert result == []
+    # Untouched.
+    assert p.model == "sentinel-model"
+    assert p.noise_model == "sentinel-noise"
+
+
+def test_compile_dit_skips_missing_attrs():
+    """Pipelines that have only `model` should compile only `model`
+    (not raise on the absent `noise_model`/`low_noise_model`).
+    """
+    import torch
+    from wan.distributed.compile_util import compile_dit
+
+    class FakePipeline:
+        def __init__(self):
+            self.model = torch.nn.Linear(4, 4)
+
+    p = FakePipeline()
+    result = compile_dit(p, enabled=True)
+    # On environments without a working compile backend (e.g. CPU-only
+    # CI), torch.compile may still wrap; we accept any result with
+    # exactly ["model"] as the matched attribute set.
+    assert result == ["model"]
+    # The replaced attribute must still be call-able (compile wraps,
+    # doesn't replace with None).
+    assert callable(p.model)
 
 
 # ---------------------------------------------------------------------------
@@ -184,12 +328,18 @@ def test_full_flag_matrix_phase1(quant: str, attn: str, compile_flag: str):
 # ---------------------------------------------------------------------------
 
 
-def test_eta_constants_match_phase1_baseline():
-    """Per docs/path-b-acceptance.md and bench_artifacts/...path-b-baseline-fp8.json,
-    Phase 1 slope is 1.235 s/frame at offset 191 s."""
+def test_eta_constants_match_current_baseline():
+    """Per docs/path-b-acceptance.md and bench_artifacts, the warm
+    per-job slope at Phase 1 was 1.235 s/frame at offset 191 s; that
+    has not been re-fit at Phase 2/3 because the per-step latency only
+    moved from 5.83 s to ~5.18 s (sage) and we haven't lowered to the
+    Phase 3 target yet. Cold-start bumped at Phase 3 from 86 → 360 to
+    cover the first-forward torch.compile cost (~270 s), per the Phase
+    3 acceptance criterion that first job ≤ 480 s with compile on.
+    """
     from server import config as server_config
     importlib.reload(server_config)
     assert server_config._T_OFFSET == pytest.approx(191.0)
     assert server_config._T_PER_FRAME == pytest.approx(1.235)
-    # Cold-start bonus stays at 86 — compile not landed.
-    assert server_config._T_COLD_START_BONUS == pytest.approx(86.0)
+    # Cold-start bonus bumped at Phase 3 to cover compile cost.
+    assert server_config._T_COLD_START_BONUS == pytest.approx(360.0)
