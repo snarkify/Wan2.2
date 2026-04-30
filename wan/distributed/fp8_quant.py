@@ -48,7 +48,7 @@ log = logging.getLogger("wan.fp8_quant")
 _FP8_MAX = 448.0
 
 
-def _quantize_linear_inplace(linear: nn.Linear) -> None:
+def _quantize_linear_inplace(linear: nn.Linear, name: str = "<unnamed>") -> None:
     """Cast `linear.weight` to fp8_e4m3fn in place + register `scale_weight`.
 
     After this call:
@@ -57,13 +57,26 @@ def _quantize_linear_inplace(linear: nn.Linear) -> None:
           dequant(linear.weight) ~= linear.weight.to(bf16) * scale_weight
       - linear.original_forward holds the original Linear.forward
       - linear.forward is replaced with the fp8 scaled_mm path
+
+    `name` is used purely for diagnostics on alignment failure.
     """
     w = linear.weight.data  # bf16 at this point
-    in_features = w.shape[1]
-    if in_features % 16 != 0:
+    out_features, in_features = w.shape[0], w.shape[1]
+    # `torch._scaled_mm` requires both K (in_features) and N (out_features)
+    # to be multiples of 16. The K check has been here from day one; the N
+    # check was a latent footgun — TI2V-5B happens to align on N today, but
+    # any future Wan variant with an odd projection width would silently
+    # fail at runtime. Log layer name + shape before raising so the offender
+    # is immediately identifiable.
+    if in_features % 16 != 0 or out_features % 16 != 0:
+        log.error(
+            "fp8_quant: alignment failure on Linear %s: in=%d out=%d (need both %% 16 == 0)",
+            name, in_features, out_features,
+        )
         raise ValueError(
-            f"fp8 _scaled_mm requires in_features%16==0, got {in_features} "
-            f"for Linear({linear.in_features}->{linear.out_features})"
+            f"fp8 _scaled_mm requires both in_features%16==0 and "
+            f"out_features%16==0, got in={in_features} out={out_features} "
+            f"for Linear {name!r} ({linear.in_features}->{linear.out_features})"
         )
 
     # Per-tensor symmetric scale.
@@ -154,7 +167,9 @@ def quantize_wan_blocks_to_fp8(model: nn.Module) -> dict:
     for block_idx, block in enumerate(model.blocks):
         for name, linear in _iter_block_linears(block):
             n_params_quantized += linear.weight.numel()
-            _quantize_linear_inplace(linear)
+            _quantize_linear_inplace(
+                linear, name=f"blocks[{block_idx}].{name}"
+            )
             n_linears += 1
         if block_idx == 0:
             # Sanity log on the first block.
