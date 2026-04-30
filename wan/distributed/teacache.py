@@ -270,6 +270,21 @@ def enable_teacache(
 
     cls.forward = _teacache_forward
 
+    # Register cache tensors as non-persistent buffers so they ride with
+    # the module on `.cpu()` / `.to(device)` calls. Without this they
+    # stay pinned on GPU when `pipeline.generate()` does `model.cpu()`
+    # before VAE decode, and the extra ~300 MB pushes us past the 24 GB
+    # 4090 ceiling. Only register if the buffer doesn't already exist —
+    # this function is idempotent.
+    for buf_name in (
+        "_tc_previous_e0_even",
+        "_tc_previous_e0_odd",
+        "_tc_previous_residual_even",
+        "_tc_previous_residual_odd",
+    ):
+        if buf_name not in target._buffers:
+            target.register_buffer(buf_name, None, persistent=False)
+
     target._tc_thresh = float(thresh)
     target._tc_num_steps = int(num_steps)
     target._tc_use_ret_steps = bool(use_ret_steps)
