@@ -289,6 +289,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="Use the e0/_RET polynomial variant with longer "
                         "warmup (5 steps). Slightly higher quality at the "
                         "same threshold; slightly less speedup.")
+    p.add_argument("--teacache-raw", action="store_true",
+                   help="Bypass the rescaling polynomial; accumulate raw "
+                        "rel-L1 distances. Use this when the 14B polynomial "
+                        "is mis-calibrated for our 5B inputs (rel-L1 is "
+                        "smaller than the polynomial's domain, output goes "
+                        "negative). Recommended threshold range 0.05-0.20.")
+    p.add_argument("--teacache-debug", action="store_true",
+                   help="Per-call rel_l1/rescale/accum/decision logging. "
+                        "Use for calibration runs only.")
     p.add_argument("--tag", default=None,
                    help="Optional run tag appended to the JSON filename.")
     p.add_argument("--init-on-cpu", action="store_true",
@@ -357,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
             thresh=args.teacache_thresh,
             num_steps=2 * args.steps,  # CFG: cond + uncond per step
             use_ret_steps=args.teacache_use_ret_steps,
+            use_polynomial=not args.teacache_raw,
+            debug=args.teacache_debug,
         )
 
     gens: list[dict[str, Any]] = []

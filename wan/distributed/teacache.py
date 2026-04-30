@@ -151,12 +151,20 @@ def _teacache_forward(self, x, t, context, seq_len, y=None):
     if in_warmup or in_cooldown or prev_e0 is None:
         should_calc = True
         setattr(self, accum_attr, 0.0)
+        if self._tc_debug:
+            logging.info(
+                "[TEACACHE] cnt=%d %s warmup/cooldown -> compute",
+                self._tc_cnt, parity,
+            )
     else:
         # `.cpu().item()` forces a sync; this is intentional (without
         # it the rescaled accumulator can't drive a Python branch).
         rel_l1 = ((modulated_inp - prev_e0).abs().mean()
                   / prev_e0.abs().mean()).cpu().item()
-        rescale = float(np.poly1d(self._tc_coefficients)(rel_l1))
+        if self._tc_use_polynomial:
+            rescale = float(np.poly1d(self._tc_coefficients)(rel_l1))
+        else:
+            rescale = rel_l1  # raw mode: skip the polynomial entirely
         new_accum = getattr(self, accum_attr) + rescale
         if new_accum < self._tc_thresh:
             should_calc = False
@@ -164,6 +172,12 @@ def _teacache_forward(self, x, t, context, seq_len, y=None):
         else:
             should_calc = True
             setattr(self, accum_attr, 0.0)
+        if self._tc_debug:
+            logging.info(
+                "[TEACACHE] cnt=%d %s rel_l1=%.6f rescale=%.6f accum=%.6f -> %s",
+                self._tc_cnt, parity, rel_l1, rescale, new_accum,
+                "compute" if should_calc else "skip",
+            )
 
     setattr(self, prev_e0_attr, modulated_inp.clone())
 
@@ -203,6 +217,8 @@ def enable_teacache(
     use_ret_steps: bool = False,
     ret_steps: int = 1,
     coefficients: Optional[Sequence[float]] = None,
+    use_polynomial: bool = True,
+    debug: bool = False,
 ) -> None:
     """Install TeaCache on a Wan2.2 DiT module.
 
@@ -227,6 +243,19 @@ def enable_teacache(
             increase to 5 per the reference recipe.
         coefficients: 5-element polynomial. Defaults to the 14B set
             (closest published to our 5B model).
+        use_polynomial: True applies the rescaling polynomial; False
+            uses raw rel-L1 directly (bypass mode). The 14B polynomial
+            produces negative rescaled values for typical 5B/Wan2.2
+            rel-L1 inputs (which are O(0.01-0.05), well below the
+            polynomial's calibration domain), so the accumulator can
+            never grow past the threshold. Bypass mode reads raw
+            rel-L1 as a positive monotonic distance signal — at the
+            cost of losing the calibration that maps embedding-space
+            distance to true output drift. Recommended threshold range
+            shifts to 0.05-0.20 in raw mode.
+        debug: if True, log per-call rel_l1, rescale, accum, decision.
+            Set this only for short calibration runs — the format is
+            verbose and the .cpu().item() is already on the hot path.
     """
     if coefficients is None:
         coefficients = (
@@ -253,13 +282,16 @@ def enable_teacache(
         num_steps if use_ret_steps else num_steps - 2
     )
     target._tc_coefficients = tuple(coefficients)
+    target._tc_use_polynomial = bool(use_polynomial)
+    target._tc_debug = bool(debug)
     reset_teacache(target)
 
     logging.info(
         "[WAN_DEMO_TEACACHE] enabled thresh=%.3f num_steps=%d "
-        "ret_steps=%d cutoff_steps=%d use_ret_steps=%s",
+        "ret_steps=%d cutoff_steps=%d use_ret_steps=%s "
+        "use_polynomial=%s debug=%s",
         thresh, num_steps, ret_steps, target._tc_cutoff_steps,
-        use_ret_steps,
+        use_ret_steps, use_polynomial, debug,
     )
 
 
