@@ -189,6 +189,18 @@ class WanTI2V:
         rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
         if rank0:
             logging.info(f"[WAN_DEMO_QUANT] mode={quant_mode}")
+            # Surface the resolved attention backend so demo logs show
+            # which path the warm sampler is on. Cheap import: the
+            # dispatcher only reads an env var.
+            from .modules.attention import (
+                _resolve_attn_backend, SAGE_ATTN_AVAILABLE,
+            )
+            attn_backend = _resolve_attn_backend()
+            attn_mode_env = os.environ.get("WAN_DEMO_ATTN", "auto").lower()
+            logging.info(
+                f"[WAN_DEMO_ATTN] mode={attn_mode_env} "
+                f"resolved={attn_backend} sage_available={SAGE_ATTN_AVAILABLE}"
+            )
 
         # World-size=1 guard: FSDP with a single rank is a no-op for sharding
         # but still adds wrap/unflatten overhead and forces MixedPrecision.

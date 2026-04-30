@@ -37,10 +37,11 @@ import pytest
 _PHASE1_QUANT_VALID = ["bf16", "fp8", "fp8_fast"]
 _PHASE1_QUANT_INVALID = ["int8", "fp16", "", "FP8", "fp8-fast", "BF16 "]
 
-# Phase 2 will populate; keep them as single-value lists so the matrix
-# still iterates and the tests start passing for the new phase by
-# extending these lists.
-_PHASE1_ATTN_VALID = ["flash"]
+# Phase 2 wires sage into WAN_DEMO_ATTN. The dispatcher accepts
+# "auto"/"sage"/"flash" (auto is the default — picks sage if
+# importable, else flash). "flash" remains the canonical fallback.
+# Compile is still Phase-3 territory.
+_PHASE1_ATTN_VALID = ["auto", "sage", "flash"]
 _PHASE1_COMPILE_VALID = ["0"]
 
 
