@@ -113,10 +113,16 @@ def _mem_snapshot(label: str) -> dict[str, int]:
     return snap
 
 
-def _build_pipeline(ckpt_dir: str):
+def _build_pipeline(ckpt_dir: str, init_on_cpu: bool = False):
     """Mirror of server.worker._get_or_build_pipeline, minus the global
     singleton (this harness owns the lifetime; one process = one bench
-    run, no need for module-level state)."""
+    run, no need for module-level state).
+
+    `init_on_cpu=True` keeps the DiT on CPU at construction so T5+DiT
+    don't both occupy 4090 VRAM at the same time. Required for the
+    bf16 quality-reference path (T5-bf16 ~10 GB + DiT-bf16 ~10 GB +
+    overhead exceeds 24 GB if both are GPU-resident). Production uses
+    `init_on_cpu=False` because fp8 DiT is half the size."""
     from wan import configs as wan_configs
     from wan.textimage2video import WanTI2V
 
@@ -129,12 +135,12 @@ def _build_pipeline(ckpt_dir: str):
     use_sp = world_size > 1
 
     logging.info(
-        "building WanTI2V: rank=%d world=%d quant=%s attn=%s compile=%s ckpt=%s",
+        "building WanTI2V: rank=%d world=%d quant=%s attn=%s compile=%s init_on_cpu=%s ckpt=%s",
         rank, world_size,
         os.environ.get("WAN_DEMO_QUANT", "bf16"),
         os.environ.get("WAN_DEMO_ATTN", "flash"),
         os.environ.get("WAN_DEMO_COMPILE", "0"),
-        ckpt_dir,
+        init_on_cpu, ckpt_dir,
     )
     torch.cuda.reset_peak_memory_stats(local_rank)
     t0 = time.perf_counter()
@@ -147,7 +153,7 @@ def _build_pipeline(ckpt_dir: str):
         dit_fsdp=use_fsdp,
         use_sp=use_sp,
         t5_cpu=False,
-        init_on_cpu=False,
+        init_on_cpu=init_on_cpu,
         convert_model_dtype=True,
     )
     elapsed = time.perf_counter() - t0
@@ -248,6 +254,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="Sets WAN_DEMO_COMPILE. Phase 3+; ignored otherwise.")
     p.add_argument("--tag", default=None,
                    help="Optional run tag appended to the JSON filename.")
+    p.add_argument("--init-on-cpu", action="store_true",
+                   help="Keep DiT on CPU at construction (move to GPU only "
+                        "during diffusion). Required for bf16 on 24 GB GPUs "
+                        "where T5+DiT both bf16 don't co-fit; production "
+                        "fp8 path uses False since fp8 DiT is ~9 GB.")
     args = p.parse_args(argv)
 
     if not args.ckpt:
@@ -292,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
     json_name = f"{branch}_{ts}_{config_tag}{tag_suffix}.json"
     json_path = bench_root / json_name
 
-    pipeline, build_s = _build_pipeline(args.ckpt)
+    pipeline, build_s = _build_pipeline(args.ckpt, init_on_cpu=args.init_on_cpu)
 
     gens: list[dict[str, Any]] = []
     for i in range(1, args.num_gens + 1):
