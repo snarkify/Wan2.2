@@ -169,11 +169,23 @@ class WanTI2V:
         # WAN_DEMO_QUANT=fp8 enables fp8_e4m3fn weights + torch._scaled_mm
         # for transformer-block Linears. Default bf16. See
         # wan/distributed/fp8_quant.py for the conversion + forward patch.
+        #
+        # `fp8_fast` is an alias for `fp8`: our implementation is already
+        # algorithmically identical to kijai's `fp8_e4m3fn_fast` path
+        # (per-tensor symmetric scale, ±448 e4m3fn clamp, torch._scaled_mm
+        # with scale_a=1.0). The alias exists so callers configuring with
+        # kijai's vocabulary land on the same code path without surprise.
+        # See bench_artifacts/perf-path-b_20260430-030223_qfp8_aflash_c0_f81_s50_pathb-baseline-fp8.json
+        # for the calibration that established this equivalence.
         quant_mode = os.environ.get("WAN_DEMO_QUANT", "bf16").lower()
-        if quant_mode not in ("bf16", "fp8"):
+        if quant_mode not in ("bf16", "fp8", "fp8_fast"):
             raise ValueError(
-                f"WAN_DEMO_QUANT must be 'bf16' or 'fp8', got {quant_mode!r}"
+                "WAN_DEMO_QUANT must be 'bf16', 'fp8', or 'fp8_fast' "
+                f"(alias for 'fp8'), got {quant_mode!r}"
             )
+        # Normalize the alias: downstream code only branches on bf16 vs fp8.
+        if quant_mode == "fp8_fast":
+            quant_mode = "fp8"
         rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
         if rank0:
             logging.info(f"[WAN_DEMO_QUANT] mode={quant_mode}")
