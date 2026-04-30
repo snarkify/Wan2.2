@@ -14,6 +14,7 @@ Honored env vars (forward-compatible across phases):
     WAN_DEMO_QUANT     bf16 | fp8 | fp8_fast (fp8_fast lands in Phase 1)
     WAN_DEMO_ATTN      flash | sage          (Phase 2)
     WAN_DEMO_COMPILE   0 | 1                  (Phase 3)
+    WAN_DEMO_TEACACHE_THRESH  float          (Phase 4 spike; unset = off)
 
 CLI args mirror the canonical bench config from
 `docs/path-b-acceptance.md`. The defaults are the bench config; pass
@@ -184,6 +185,7 @@ def _run_one_gen(
     seed: int,
     sampling_steps: int,
     save_path: str,
+    teacache_enabled: bool = False,
 ) -> dict[str, Any]:
     """Run a single generate() and return per-gen stats. Save mp4 inline,
     drop the tensor before returning (mirrors the inline-save fix in
@@ -194,6 +196,14 @@ def _run_one_gen(
 
     enter = _mem_snapshot("enter_run_job")
     torch.cuda.reset_peak_memory_stats(local_rank)
+
+    if teacache_enabled:
+        # Reset cnt/accumulators/residuals so each gen starts fresh.
+        # Without this, gen N+1 inherits gen N's even/odd parity offset
+        # and residuals — the first ~2 forwards of gen N+1 would skip
+        # against stale state from gen N.
+        from wan.distributed.teacache import reset_teacache
+        reset_teacache(pipeline.model)
 
     t0 = time.perf_counter()
     result = pipeline.generate(
@@ -228,13 +238,17 @@ def _run_one_gen(
     torch.cuda.empty_cache()
     after_save = _mem_snapshot("after_save_inline")
 
-    return {
+    out = {
         "wall_s": wall,
         "mean_step_s": wall / sampling_steps,
         "enter": enter,
         "after_generate": after_gen,
         "after_save": after_save,
     }
+    if teacache_enabled:
+        from wan.distributed.teacache import teacache_stats
+        out["teacache"] = teacache_stats(pipeline.model)
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -266,6 +280,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--compile", dest="compile_flag",
                    choices=["0", "1"], default=None,
                    help="Sets WAN_DEMO_COMPILE. Phase 3+; ignored otherwise.")
+    p.add_argument("--teacache-thresh", type=float, default=None,
+                   help="Enable TeaCache step-caching at this rescaled-rel-L1 "
+                        "accumulator threshold. Recommended 0.15-0.25 on 5B. "
+                        "Unset = caching off. Disable model-level compile "
+                        "when this is on (data-dependent Python branch).")
+    p.add_argument("--teacache-use-ret-steps", action="store_true",
+                   help="Use the e0/_RET polynomial variant with longer "
+                        "warmup (5 steps). Slightly higher quality at the "
+                        "same threshold; slightly less speedup.")
     p.add_argument("--tag", default=None,
                    help="Optional run tag appended to the JSON filename.")
     p.add_argument("--init-on-cpu", action="store_true",
@@ -319,6 +342,23 @@ def main(argv: list[str] | None = None) -> int:
 
     pipeline, build_s = _build_pipeline(args.ckpt, init_on_cpu=args.init_on_cpu)
 
+    teacache_enabled = args.teacache_thresh is not None
+    if teacache_enabled:
+        if compile_on in ("1", "true", "yes", "on"):
+            logging.warning(
+                "TeaCache + torch.compile: the data-dependent Python "
+                "branch in the cached forward forces graph breaks; "
+                "expect compile speedup to be largely lost. Spike "
+                "should run with --compile 0."
+            )
+        from wan.distributed.teacache import enable_teacache
+        enable_teacache(
+            pipeline.model,
+            thresh=args.teacache_thresh,
+            num_steps=2 * args.steps,  # CFG: cond + uncond per step
+            use_ret_steps=args.teacache_use_ret_steps,
+        )
+
     gens: list[dict[str, Any]] = []
     for i in range(1, args.num_gens + 1):
         save_path = str(out_dir / f"gen_{i}.mp4")
@@ -331,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             sampling_steps=args.steps,
             save_path=save_path,
+            teacache_enabled=teacache_enabled,
         )
         stats["index"] = i
         stats["save_path"] = save_path
@@ -352,6 +393,11 @@ def main(argv: list[str] | None = None) -> int:
             "WAN_DEMO_ATTN": attn,
             "WAN_DEMO_COMPILE": compile_on,
             "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+        },
+        "teacache": {
+            "enabled": teacache_enabled,
+            "thresh": args.teacache_thresh,
+            "use_ret_steps": args.teacache_use_ret_steps,
         },
         "config": {
             "prompt": args.prompt,
