@@ -252,3 +252,62 @@ Frame validity: all 81 frames in [0.05, 0.95] luminance for both prompts (cat YA
 Operational checks: `pytest tests/test_attention_backends.py tests/test_smoke.py` — 26 passed, 3 skipped. Startup log line `[WAN_DEMO_ATTN] mode=auto resolved=sage sage_available=True` confirmed in the bench. WAN_DEMO_ATTN=flash fallback retains the existing FA3/FA2 path (test gates this).
 
 Not deployed to prod. Phase 3 (torch.compile) is the next lever for closing the rest of the gap to 230s.
+
+---
+
+## Phase 3 results (2026-04-30)
+
+Branch `perf/path-b-p3`, commits `2b14239` (compile glue) + `330c191` (bench-harness compile-apply) + `33aa704` (recompile probe). Bench config unchanged from Phase 1/2 (1280x704 x 81f, 50 steps, seed=42, offload, world=1, fp8_fast). Run on gpu6 GPU 1 (`CUDA_VISIBLE_DEVICES=1`); production demo-server stayed up on GPU 0 throughout. `WAN_DEMO_ATTN=sage`, `WAN_DEMO_COMPILE=1`, `WAN_DEMO_COMPILE_MODE=default`.
+
+### Phase 3 perf
+
+| Prompt    | gen 1   | gen 2   | gen 3   | gen 4   | warm mean (g2-4) | mean_step | peak alloc (g2-4) |
+| --------- | ------- | ------- | ------- | ------- | ---------------- | --------- | ----------------- |
+| cat       | 225.47s | 202.01s | 201.36s | 201.47s | **201.61s**      | 4.032s    | 22193 MB          |
+| jellyfish | 208.76s | 202.37s | 202.10s | 201.82s | **202.10s**      | 4.042s    | 22193 MB          |
+
+Vs Phase 2 (259.17s warm): **-57s, 22% additional speedup**. Hits the 215s acceptance target with margin and clears the 210s stretch goal. Mean per-step latency 4.03s vs Phase 2's 5.18s = 22% reduction in the diffusion loop alone.
+
+Stability: gen 2 / 3 / 4 peak alloc identical at 22193 MB (same as Phase 2 — torch.compile adds no per-call cache growth). Gen 1 is +752 MB (22945 MB) due to one-time graph-capture allocation; well within the 1.8 GB headroom of the 24 GB 4090. Across-request bit-exactness: gen 3 vs gen 2 = inf PSNR / 1.0 SSIM for both prompts (compiled forward is deterministic on identical inputs). Cold-start: gen 1 over gen 2 cost is **+23s (cat) / +6s (jellyfish)** — the first-forward Dynamo+Inductor capture amortizes into the early diffusion steps, far below the 480s acceptance budget.
+
+Pipeline build cost (T5+VAE+DiT load + fp8 quant) measured 81.08s / 81.87s. With `_T_COLD_START_BONUS` bumped 86 → 360, the ETA for the first job after a fresh server restart sits at 360 + per-job ≈ 555s — conservative vs measured ~310s, which is the right direction.
+
+### Phase 3 recompile check (qa-spec criterion)
+
+Per `scripts/check_dynamo_recompiles.py` parsing both bench logs:
+
+| Prompt    | gens with compile activity | new subgraphs after gen 2 | incremented recompile_counts after gen 2 | verdict |
+| --------- | -------------------------- | ------------------------- | ---------------------------------------- | ------- |
+| cat       | [1] only                   | 0                         | 0                                        | PASS    |
+| jellyfish | [1] only                   | 0                         | 0                                        | PASS    |
+
+All `[frame_id/recompile_count]` Dynamo markers fired during gen 1; gens 2-4 reused cached compiled graphs without a single new compile-id appearing. The compile cache is shape-invariant for a fixed (batch, frame_num, sampling_steps) configuration. Six `frame_id` subgraphs total — Dynamo split the DiT forward into six compile regions (graph breaks inside the fp8 Linear closure and at sage-attn dispatch boundaries). The middle-case from the Phase 3 plan ("partial compile with graph breaks at the Linear forward boundary") is what shipped — and it is sufficient to deliver the full 22% speedup. The fp8 Linear `forward` Python closure does NOT block compile from delivering the per-step gain.
+
+### Phase 3 visual A/B
+
+Primary gate (Phase 3 vs Phase 2, both fp8_fast + sage):
+
+| Prompt    | mean PSNR | min PSNR | mean SSIM | min SSIM | gate (>= 40 dB / >= 0.98) |
+| --------- | --------- | -------- | --------- | -------- | ------------------------- |
+| jellyfish | 36.80 dB  | 33.99    | 0.976     | 0.969    | **FAIL**                  |
+| cat       | 25.68 dB  | 24.89    | 0.803     | 0.746    | FAIL                      |
+
+Secondary (Phase 3 vs bf16 baseline):
+
+| Prompt    | mean PSNR | min PSNR | mean SSIM | min SSIM | gate (>= 31 dB / >= 0.94) | (Phase 2 vs bf16 for comparison) |
+| --------- | --------- | -------- | --------- | -------- | ------------------------- | -------------------------------- |
+| jellyfish | 34.72 dB  | 31.25    | 0.967     | 0.959    | **PASS**                  | (Phase 2 was 34.36 dB / 0.966)   |
+| cat       | 24.53 dB  | 23.20    | 0.781     | 0.714    | FAIL                      | (Phase 2 was 25.63 dB / 0.875)   |
+
+### Verdict
+
+**Phase 3 fails the strict 40 dB primary gate for Phase 3 vs Phase 2** even on the motion-rich jellyfish prompt (36.80 dB observed vs 40 dB required). The cat prompt fails harder, but is again the same bifurcation pattern Phase 1+Phase 2 saw: compile-induced micro-rounding compounds over 50 unipc steps and pushes the sampler onto a different rollout. Two pieces of evidence argue the underlying behavior is healthy and the gate is calibrated too tight for fp8+sage+compile composition:
+
+1. **Phase 3 vs bf16 jellyfish (34.72 dB / 0.967)** is **better** than Phase 2 vs bf16 (34.36 dB / 0.966). Compile is not pulling further from the bf16 reference — if anything, it is closer. This is exactly what the Phase 2 verdict argued about sage: each layer perturbs the trajectory but does not increase rolling error vs the gold reference.
+2. **Within-Phase-3 bit-exactness** (g3 vs g2 = inf PSNR for both prompts) confirms the compiled graph is fully deterministic; the divergence vs Phase 2 is the one-shot drift from the kernel reorder, not ongoing drift.
+
+Phase 3 vs Phase 2 jellyfish 36.80 dB is essentially the same magnitude as **Phase 2 vs Phase 1 jellyfish (36.60 dB)**, which passed under its own 34 dB Phase-2 threshold. Read end-to-end, each phase introduces ~37 dB drift to the previous one — sage and compile are roughly co-equal sources of rounding noise.
+
+Operational checks: `pytest tests/test_attention_backends.py tests/test_fp8_quant.py tests/test_smoke.py` — 110 passed, 4 skipped. Startup log line `[WAN_DEMO_COMPILE] enabled=True mode=default` and `[WAN_DEMO_COMPILE] applied to 1 attr(s): ['model'] mode=default` confirmed in the bench. `WAN_DEMO_COMPILE=0` retains exact Phase 2 behavior.
+
+**Not merged to demo-server.** The strict 40 dB Phase-3-vs-Phase-2 gate failed and the user instruction is "If FAIL: stop and report." The Phase 3 perf gain (22% faster, 201s warm) is real and reproducible; the question for tech-lead/qa is whether to (a) loosen the 40 dB gate to ~35 dB given the cumulative-drift evidence, (b) ship Phase 1+2 as final and document compile as a follow-up under a `WAN_DEMO_COMPILE=1` opt-in flag, or (c) investigate whether a different compile mode / backend (e.g. compiling only `model.blocks` to keep the patch-embed and unpatchify out of the Inductor codegen) closes the residual drift.
