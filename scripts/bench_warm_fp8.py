@@ -158,6 +158,20 @@ def _build_pipeline(ckpt_dir: str, init_on_cpu: bool = False):
     )
     elapsed = time.perf_counter() - t0
     logging.info("pipeline built in %.2fs", elapsed)
+
+    # Phase 3: apply torch.compile to the DiT singleton when
+    # WAN_DEMO_COMPILE=1. Mirrors `server/worker.py:_get_or_build_pipeline`.
+    # The compile is lazy (Dynamo+Inductor capture happens on first
+    # forward), so the wall time of gen 1 absorbs the compile cost.
+    compile_env = os.environ.get("WAN_DEMO_COMPILE", "0").strip().lower()
+    if compile_env in ("1", "true", "yes", "on"):
+        from wan.distributed.compile_util import (
+            compile_dit, resolve_compile_mode,
+        )
+        mode = resolve_compile_mode(os.environ.get("WAN_DEMO_COMPILE_MODE"))
+        logging.info("applying torch.compile mode=%s", mode)
+        compile_dit(pipeline, mode=mode, enabled=True)
+
     return pipeline, elapsed
 
 
