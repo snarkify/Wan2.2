@@ -33,6 +33,17 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
+# Diagnostic scheduler swap: import diffusers' UniPCMultistepScheduler lazily
+# only when needed, so that the import doesn't add to default startup. We
+# isinstance-check against this in the step() call site to handle the API
+# difference (no generator= kwarg).
+try:
+    from diffusers.schedulers.scheduling_unipc_multistep import (
+        UniPCMultistepScheduler as _DiffusersUniPCRef,
+    )
+except ImportError:
+    _DiffusersUniPCRef = type('_DiffusersUniPCRef_Unavailable', (), {})
+
 
 class WanT2V:
 
@@ -321,12 +332,32 @@ class WanT2V:
             boundary = self.boundary * self.num_train_timesteps
 
             if sample_solver == 'unipc':
-                sample_scheduler = FlowUniPCMultistepScheduler(
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False)
-                sample_scheduler.set_timesteps(
-                    sampling_steps, device=self.device, shift=shift)
+                # Diagnostic env-flag: use diffusers' UniPCMultistepScheduler
+                # instead of our local FlowUniPCMultistepScheduler. They are
+                # the same family but produce subtly different timesteps and
+                # sigmas at flow_shift=12 — the cumulative drift over 40 steps
+                # explains the ~18 dB delta vs diffusers vanilla output.
+                if os.environ.get('WAN_USE_DIFFUSERS_SCHEDULER') == '1':
+                    from diffusers.schedulers.scheduling_unipc_multistep import (
+                        UniPCMultistepScheduler,
+                    )
+                    sample_scheduler = UniPCMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        prediction_type='flow_prediction',
+                        use_flow_sigmas=True,
+                        flow_shift=shift,
+                        solver_order=2,
+                        solver_type='bh2',
+                    )
+                    sample_scheduler.set_timesteps(
+                        sampling_steps, device=self.device)
+                else:
+                    sample_scheduler = FlowUniPCMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=1,
+                        use_dynamic_shifting=False)
+                    sample_scheduler.set_timesteps(
+                        sampling_steps, device=self.device, shift=shift)
                 timesteps = sample_scheduler.timesteps
             elif sample_solver == 'dpm++':
                 sample_scheduler = FlowDPMSolverMultistepScheduler(
@@ -382,12 +413,21 @@ class WanT2V:
                             noise_pred_cond - noise_pred_uncond)
 
                     with spans.span("scheduler_step"):
+                        # diffusers UniPCMultistepScheduler.step() does not
+                        # accept generator= (UniPC is deterministic given
+                        # sigmas + model_output); only thread it through
+                        # when the in-tree FlowUniPCMultistepScheduler is in
+                        # use, which does accept generator=.
+                        step_kwargs = dict(
+                            return_dict=False,
+                        )
+                        if not isinstance(sample_scheduler, _DiffusersUniPCRef):
+                            step_kwargs['generator'] = seed_g
                         temp_x0 = sample_scheduler.step(
                             noise_pred.unsqueeze(0),
                             t,
                             latents[0].unsqueeze(0),
-                            return_dict=False,
-                            generator=seed_g)[0]
+                            **step_kwargs)[0]
                     latents = [temp_x0.squeeze(0)]
 
             x0 = latents
