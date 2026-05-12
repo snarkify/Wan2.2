@@ -4,13 +4,16 @@ import torch
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
+except (ImportError, OSError):
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn
     FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
+except (ImportError, OSError):
+    # ImportError (not just ModuleNotFoundError) catches the case where
+    # flash_attn is installed but its C++ extension has an undefined symbol
+    # due to a torch/cu ABI mismatch — at that point we want SDPA fallback.
     FLASH_ATTN_2_AVAILABLE = False
 
 import warnings

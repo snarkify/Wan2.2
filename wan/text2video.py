@@ -14,6 +14,11 @@ import torch.cuda.amp as amp
 import torch.distributed as dist
 from tqdm import tqdm
 
+from .distributed.cfg_parallel import (
+    cfg_all_gather,
+    get_cfg_size,
+    is_cond_rank,
+)
 from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
@@ -356,12 +361,21 @@ class WanT2V:
                     sample_guide_scale = guide_scale[1] if t.item(
                     ) >= boundary else guide_scale[0]
 
-                    with spans.span("model_forward_cond"):
-                        noise_pred_cond = model(
-                            latent_model_input, t=timestep, **arg_c)[0]
-                    with spans.span("model_forward_uncond"):
-                        noise_pred_uncond = model(
-                            latent_model_input, t=timestep, **arg_null)[0]
+                    if get_cfg_size() > 1:
+                        with spans.span("model_forward_cfg_split"):
+                            local_arg = arg_c if is_cond_rank() else arg_null
+                            local_pred = model(
+                                latent_model_input, t=timestep, **local_arg)[0]
+                        with spans.span("cfg_all_gather"):
+                            noise_pred_cond, noise_pred_uncond = cfg_all_gather(
+                                local_pred)
+                    else:
+                        with spans.span("model_forward_cond"):
+                            noise_pred_cond = model(
+                                latent_model_input, t=timestep, **arg_c)[0]
+                        with spans.span("model_forward_uncond"):
+                            noise_pred_uncond = model(
+                                latent_model_input, t=timestep, **arg_null)[0]
 
                     with spans.span("guidance_merge"):
                         noise_pred = noise_pred_uncond + sample_guide_scale * (

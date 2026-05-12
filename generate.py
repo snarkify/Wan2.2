@@ -149,6 +149,14 @@ def _parse_args():
         default=1,
         help="The size of the ulysses parallelism in DiT.")
     parser.add_argument(
+        "--cfg_parallel_size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="CFG-parallel: split the cond/uncond forwards across rank groups. "
+             "Must be 1 or 2 (Wan2.2 has exactly two CFG forwards per step). "
+             "Requires world_size == cfg_parallel_size * ulysses_size.")
+    parser.add_argument(
         "--t5_fsdp",
         action="store_true",
         default=False,
@@ -234,6 +242,15 @@ def _parse_args():
         default=False,
         help="Use torch.compile for the DiT model. First run compiles "
              "and caches kernels (~30-120s); subsequent runs reuse the cache.")
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="default",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="torch.compile mode (only meaningful with --compile_model). "
+             "default = baseline; reduce-overhead = inference-friendly fewer "
+             "graph re-captures; max-autotune = aggressive autotune (longer warmup, "
+             "potentially more numerical drift).")
 
     # animate
     parser.add_argument(
@@ -356,28 +373,45 @@ def generate(args):
             args.ulysses_size > 1
         ), f"sequence parallel are not supported in non-distributed environments."
 
-    if args.ulysses_size > 1:
+    if args.ulysses_size > 1 and args.cfg_parallel_size > 1:
+        assert args.ulysses_size * args.cfg_parallel_size == world_size, (
+            f"ulysses_size ({args.ulysses_size}) * cfg_parallel_size "
+            f"({args.cfg_parallel_size}) must equal world_size ({world_size}).")
+        init_distributed_group()
+    elif args.ulysses_size > 1:
         assert args.ulysses_size == world_size, f"The number of ulysses_size should be equal to the world size."
         init_distributed_group()
+    elif args.cfg_parallel_size > 1:
+        assert args.cfg_parallel_size == world_size, (
+            f"cfg_parallel_size ({args.cfg_parallel_size}) without ulysses must "
+            f"equal world_size ({world_size}).")
+
+    # Initialize CFG-parallel groups (no-op when cfg_parallel_size == 1).
+    if world_size > 1:
+        from wan.distributed.cfg_parallel import init_cfg_parallel
+        init_cfg_parallel(args.cfg_parallel_size)
 
     # Initialize profiling (after dist.init so RANK is available)
     profiling_init(args.profile_dir)
 
     # Set up torch.compile
     if args.compile_model:
-        logging.info("torch.compile enabled")
+        logging.info(f"torch.compile enabled (mode={args.compile_mode})")
 
     def _compile_dit(pipeline):
         """Apply torch.compile to DiT model(s) on a pipeline."""
         if not args.compile_model:
             return
         import wan.profiling as _prof
+        compile_kwargs = {}
+        if args.compile_mode != "default":
+            compile_kwargs["mode"] = args.compile_mode
         compiled_any = False
         for attr in ("model", "noise_model",
                       "low_noise_model", "high_noise_model"):
             if hasattr(pipeline, attr):
                 m = getattr(pipeline, attr)
-                compiled = torch.compile(m)
+                compiled = torch.compile(m, **compile_kwargs)
                 setattr(pipeline, attr, compiled)
                 compiled_any = True
                 logging.info(f"Compiled {attr}")

@@ -21,10 +21,23 @@ def get_world_size():
 
 
 def _time_collective(op_name: str, nbytes: int, fn):
-    """Run fn() while timing wall + GPU; record via profiling if enabled."""
-    from wan.profiling import get_config, record_collective
+    """Run fn() while timing wall + GPU; record via profiling if enabled.
+
+    Skips CUDA-event timing when torch.compile is active — Dynamo can reorder
+    the start/end record() calls relative to the collective itself, leaving
+    one event un-recorded and triggering "Both events must be recorded" on
+    elapsed_time(). Wall-clock + bytes still flow to the trace.
+    """
+    from wan.profiling import _compile_active, get_config, record_collective
     if not get_config().enabled:
         return fn()
+
+    if _compile_active:
+        t0 = time.perf_counter()
+        result = fn()
+        wall_ms = (time.perf_counter() - t0) * 1000.0
+        record_collective(op_name, nbytes, wall_ms, -1.0)
+        return result
 
     start_evt = torch.cuda.Event(enable_timing=True)
     end_evt = torch.cuda.Event(enable_timing=True)
@@ -33,8 +46,11 @@ def _time_collective(op_name: str, nbytes: int, fn):
     result = fn()
     wall_ms = (time.perf_counter() - t0) * 1000.0
     end_evt.record()
-    torch.cuda.synchronize()
-    gpu_ms = start_evt.elapsed_time(end_evt)
+    try:
+        torch.cuda.synchronize()
+        gpu_ms = start_evt.elapsed_time(end_evt)
+    except RuntimeError:
+        gpu_ms = -1.0
     record_collective(op_name, nbytes, wall_ms, gpu_ms)
     return result
 

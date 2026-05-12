@@ -2,7 +2,10 @@
 import torch
 import torch.distributed as dist
 
-from ..modules.attention import flash_attention
+# `attention` falls back to SDPA when FA2/FA3 aren't importable (e.g. ABI
+# mismatch on a fresh torch). The old direct `flash_attention` import asserted
+# FA2 hard, which made Ulysses unusable when only SDPA was available.
+from ..modules.attention import attention as flash_attention
 from .util import all_to_all
 
 
