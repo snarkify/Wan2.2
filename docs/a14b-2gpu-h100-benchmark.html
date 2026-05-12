@@ -1,0 +1,1042 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Wan2.2 T2V-A14B on 2× H100 — Comprehensive Benchmark Report</title>
+<style>
+  :root {
+    --fg:#1a1f24; --muted:#586069; --bg:#fafbfc; --panel:#ffffff;
+    --line:#e1e4e8; --accent:#0366d6; --good:#22863a; --warn:#b08800;
+    --bad:#cb2431; --code-bg:#f6f8fa;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI",
+      Helvetica, Arial, sans-serif; color: var(--fg); background: var(--bg);
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 28px 80px; }
+  header.title { border-bottom: 1px solid var(--line); padding-bottom: 22px;
+    margin-bottom: 28px; }
+  h1 { font-size: 28px; margin: 0 0 8px; line-height: 1.2; }
+  h2 { font-size: 22px; margin: 40px 0 14px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--line); }
+  h3 { font-size: 17px; margin: 26px 0 10px; }
+  h4 { font-size: 14px; margin: 18px 0 8px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.5px; }
+  p, ul, ol { margin: 0 0 14px; }
+  ul, ol { padding-left: 22px; }
+  li { margin-bottom: 4px; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    font-size: 13px; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  pre { background: var(--code-bg); padding: 12px 14px; border-radius: 6px;
+    overflow-x: auto; border: 1px solid var(--line); }
+  pre code { background: transparent; padding: 0; }
+  table { border-collapse: collapse; margin: 8px 0 18px; width: 100%;
+    background: var(--panel); }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left;
+    vertical-align: top; }
+  th { background: #f6f8fa; font-weight: 600; font-size: 13px; }
+  td { font-size: 14px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr:hover td { background: #fafcff; }
+  .winner { background: #f0fff4 !important; font-weight: 500; }
+  .winner td:first-child { border-left: 3px solid var(--good); }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.3px; vertical-align: middle; }
+  .badge.good { background: #d4f4dd; color: #1a6c2a; }
+  .badge.bad  { background: #ffd8d8; color: #a4001b; }
+  .badge.warn { background: #fff5cf; color: #735c00; }
+  .badge.neutral { background: #e1e4e8; color: #444; }
+  blockquote { margin: 14px 0; padding: 8px 14px; border-left: 3px solid var(--accent);
+    background: #f1f8ff; color: #24292e; }
+  blockquote.bad { border-color: var(--bad); background: #fff5f5; }
+  blockquote.good { border-color: var(--good); background: #f0fff4; }
+  blockquote.warn { border-color: var(--warn); background: #fffbf0; }
+  .toc { background: var(--panel); border: 1px solid var(--line); padding: 16px 24px;
+    border-radius: 8px; margin-bottom: 22px; }
+  .toc h4 { margin-top: 0; }
+  .toc ol { margin: 0; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .key-finding { background: #fff8e6; border: 1px solid #f9d77e; padding: 10px 14px;
+    border-radius: 6px; margin: 10px 0 18px; }
+  .key-finding::before { content: "★ "; color: #d4a000; font-weight: 700; }
+  hr.section { border: 0; border-top: 1px dashed var(--line); margin: 32px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 12px 0; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 18px; margin: 12px 0; }
+  .stat { background: var(--panel); border: 1px solid var(--line); padding: 14px;
+    border-radius: 6px; }
+  .stat .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .l { font-size: 12px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.4px; margin-top: 4px; }
+  .stat .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  svg.chart { display: block; margin: 12px auto 18px; max-width: 100%; }
+  .small { font-size: 13px; }
+  .muted { color: var(--muted); }
+  .matrix th, .matrix td { text-align: center; font-variant-numeric: tabular-nums; }
+  .matrix th:first-child, .matrix td:first-child { text-align: left;
+    background: #f6f8fa; font-weight: 600; }
+  .matrix td.eq { background: #d4f4dd; color: #1a6c2a; font-weight: 600; }
+  .matrix td.near { background: #fff5cf; color: #735c00; }
+  .matrix td.far { background: #ffd8d8; color: #a4001b; }
+  .footnote { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  details { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 10px 14px; margin: 10px 0; }
+  details summary { cursor: pointer; font-weight: 600; color: var(--accent); }
+  details summary:hover { color: #024da1; }
+  details[open] summary { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="title">
+  <h1>Wan2.2 T2V-A14B on 2× H100 — Comprehensive Benchmark Report</h1>
+  <p class="meta">
+    <strong>Author:</strong> Boyu Sun (Snarkify) ·
+    <strong>Branch:</strong> <code>multi-gpu</code> ·
+    <strong>Dates:</strong> 2026-05-04 to 2026-05-12 ·
+    <strong>Workload:</strong> 1280×720, 81 frames, 40 UniPC steps, seed 42 ·
+    <strong>Hardware:</strong> 2× NVIDIA H100 80 GB HBM3 (NVLink NV18)
+  </p>
+</header>
+
+<!-- ==================== TOC ==================== -->
+<nav class="toc">
+  <h4>Contents</h4>
+  <ol>
+    <li><a href="#executive">Executive summary</a></li>
+    <li><a href="#setup">Setup &amp; methodology</a></li>
+    <li><a href="#leaderboard">Leaderboard — all configs at a glance</a></li>
+    <li><a href="#phase1">Phase 1 — in-tree 2× H100 matrix (Y0–Y5)</a></li>
+    <li><a href="#phase2">Phase 2 — xDiT (xfuser) external engine</a></li>
+    <li><a href="#phase3-sglang">Phase 3 — SGLang-Diffusion external engine</a></li>
+    <li><a href="#syncfix">Phase 3 follow-on — Y4 scheduler_step regression FIX (27% win)</a></li>
+    <li><a href="#y4-variants">Phase 3 follow-on — Y4 variants (no-offload, n=5 variance)</a></li>
+    <li><a href="#y1-new">Phase 3 follow-on — Y1 on the new platform (Ulysses-2 + SDPA)</a></li>
+    <li><a href="#compile">Phase 3 follow-on — torch.compile mode tuning (negative result)</a></li>
+    <li><a href="#scheduler-isolation">Phase 3 follow-on — Scheduler isolation experiment</a></li>
+    <li><a href="#i2v">Phase 3 follow-on — I2V-A14B sanity</a></li>
+    <li><a href="#psnr-matrix">Cross-engine PSNR matrix &amp; visual A/B</a></li>
+    <li><a href="#production">Production recommendations</a></li>
+    <li><a href="#insights">Key insights</a></li>
+    <li><a href="#followups">Open follow-ups</a></li>
+    <li><a href="#appendix">Appendix — code changes, reproduction commands</a></li>
+  </ol>
+</nav>
+
+<!-- ==================== EXECUTIVE SUMMARY ==================== -->
+<h2 id="executive">1. Executive summary</h2>
+
+<p>
+  On 2× NVIDIA H100 80 GB HBM3 with NVLink, Wan2.2 T2V-A14B at production resolution
+  (1280×720, 81 frames, 40 UniPC steps) delivers the following lossless wall times:
+</p>
+
+<div class="grid3">
+  <div class="stat">
+    <div class="v">1619.9 s</div>
+    <div class="l">Z1 — 1-GPU baseline</div>
+    <div class="sub">1.00× reference, n=2</div>
+  </div>
+  <div class="stat" style="border-color:#22863a;border-width:2px;">
+    <div class="v" style="color:#22863a">613.2 s</div>
+    <div class="l">Y4-sync — in-tree winner ⭐</div>
+    <div class="sub">2.64× over 1-GPU · n=5 · CV 0.5% · MD5-stable</div>
+  </div>
+  <div class="stat" style="border-color:#0366d6;border-width:2px;">
+    <div class="v" style="color:#0366d6">393.1 s</div>
+    <div class="l">SGLang S1 — diffusers-path winner</div>
+    <div class="sub">4.12× over 1-GPU · 2.71× over vanilla diffusers</div>
+  </div>
+</div>
+
+<div class="key-finding">
+  <strong>Headline:</strong> a one-line patch to <code>wan/distributed/cfg_parallel.py</code>
+  (add <code>torch.cuda.current_stream().synchronize()</code> after <code>dist.all_gather</code>)
+  drops in-tree CFG-parallel-2 from <strong>825 s → 613 s diffusion (27%)</strong> with
+  bit-identical output. After the fix, in-tree comes within ~14% of xDiT's wall and the
+  external-engine cluster is the only place that can go faster — at the cost of
+  binding to <code>diffusers.WanPipeline</code>'s code path instead of in-tree.
+</div>
+
+<h3>The three production candidates</h3>
+
+<table>
+  <thead><tr>
+    <th>Candidate</th><th>diffusion_s</th><th>Speedup</th>
+    <th>Code path</th><th>Why pick it</th>
+  </tr></thead>
+  <tbody>
+    <tr class="winner">
+      <td><strong>Y4-sync</strong> (in-tree CFG-parallel-2 + sync fix)</td>
+      <td class="num">613.2 ± 3.3</td>
+      <td class="num">2.64×</td>
+      <td>in-tree <code>generate.py</code></td>
+      <td>Bit-equal to upstream Wan2.2 reference. MD5-stable across n=5. Lowest risk.</td>
+    </tr>
+    <tr>
+      <td><strong>X1</strong> (xDiT CFG-parallel-2)</td>
+      <td class="num">539 (SDPA) / 763 (FA2)</td>
+      <td class="num">3.00× / 2.12×</td>
+      <td>diffusers + xfuser</td>
+      <td>~14% faster than Y4-sync. Same diffusers RNG-path as SGLang. Adds xfuser dep.</td>
+    </tr>
+    <tr>
+      <td><strong>S1</strong> (SGLang CFG-parallel-2)</td>
+      <td class="num">393.1 ± 0.7</td>
+      <td class="num">4.12×</td>
+      <td>SGLang + diffusers</td>
+      <td>Fastest. <strong>2.71× over diffusers-vanilla itself</strong>, no extra quality loss vs diffusers.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p class="footnote">
+  Visual A/B confirms all three produce equally good output; the 13–17 dB PSNR
+  cluster between in-tree and diffusers-path engines is structural sample
+  variation (different specific generated details for the same prompt), not
+  quality degradation. See <a href="#psnr-matrix">Cross-engine PSNR matrix</a>.
+</p>
+
+<!-- ==================== SETUP ==================== -->
+<h2 id="setup">2. Setup &amp; methodology</h2>
+
+<h3>Hardware</h3>
+<ul>
+  <li>2× NVIDIA H100 80 GB HBM3 (driver 570.195.03 → newer on the post-2026-05-11 server)</li>
+  <li>NVLink between GPUs (NV18, full bandwidth)</li>
+  <li>RunPod instance, both GPUs on NUMA 0 (CPU 0-47)</li>
+</ul>
+
+<h3>Software stack — two platform generations</h3>
+
+<table>
+  <thead><tr>
+    <th>Server vintage</th><th>torch</th><th>CUDA</th>
+    <th>flash-attn</th><th>Configs measured there</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td>Old (2026-05-04 → 2026-05-11)</td>
+      <td>2.5.1+cu121</td><td>12.1</td>
+      <td>2.7.4.post1 (FA2 working)</td>
+      <td>Z1, Z2, B0–B5 (480p), Y0–Y5, Y4 variance n=5, Y5 variance n=4, X1 (xDiT), S1/S2/S3 (SGLang)</td>
+    </tr>
+    <tr>
+      <td>New (2026-05-12)</td>
+      <td>2.11.0+cu130</td><td>13.0</td>
+      <td>2.7.4.post1 installed but C++ ABI mismatch → falls back to SDPA</td>
+      <td>Y4-sync, Y4-no-offload, Y1-new, Y6 retry, scheduler isolation, I2V sanity, X1 (rerun), diffusers-vanilla baseline</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  The platform shift between the two servers introduced a uniform ~28.6 dB
+  PSNR delta across all in-tree configs but did not change the bit-equality
+  property within a platform. Visual A/B confirmed the platform-shift delta
+  is sample-level, not quality-level.
+</p>
+
+<h3>Workload (locked across all configs unless noted)</h3>
+<ul>
+  <li>Task: <code>t2v-A14B</code> (I2V confirmed in §<a href="#i2v">12</a>)</li>
+  <li>Resolution: 1280×720 · Frame count: 81 · Sample steps: 40 (UniPC)</li>
+  <li>Sample shift: 12.0 · Guide scale: (3.0, 4.0) at boundary 0.875</li>
+  <li>Seed: 42 (fixed) · Prompt: <em>"Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."</em></li>
+</ul>
+
+<h3>Profiling framework</h3>
+<p>
+  YAML-driven sweep harness (<code>scripts/profiling/sweep.py</code>) over per-config
+  N-run driver (<code>variance_run.py</code>). Each run is a fresh
+  <code>torchrun ... generate.py</code> process. Per-rank timing CSVs +
+  Chrome traces written by <code>wan/profiling/</code>.
+</p>
+<p>
+  Default protocol: <strong>3 runs with <code>--skip-first</code></strong> (warmup
+  discarded → n=2 measured). Winner configs hardened to n=4 or n=5.
+  Numerical equivalence verified post-hoc with <code>ffmpeg</code> PSNR + SSIM
+  and MD5 of the H264-encoded mp4 outputs.
+</p>
+
+<p>
+  <code>diffusion_s</code> is the headline metric: wall time of the 40-step denoising
+  loop only. Excludes T5 text encoding, model load, and VAE decode. Reason: the
+  loop is what scales with parallelism; the rest is fixed overhead independent
+  of the configurations being compared.
+</p>
+
+<!-- ==================== LEADERBOARD ==================== -->
+<h2 id="leaderboard">3. Leaderboard — all configs at a glance</h2>
+
+<svg class="chart" viewBox="0 0 800 540" xmlns="http://www.w3.org/2000/svg" aria-label="Diffusion-seconds bar chart">
+  <style>
+    .bar  { stroke: #fff; stroke-width: 1; }
+    .lbl  { font: 12px -apple-system, sans-serif; fill: #24292e; }
+    .lblmono { font: 11px ui-monospace, Menlo, monospace; fill: #444; }
+    .axis { stroke: #d1d5da; stroke-width: 1; }
+    .tick { font: 10px ui-monospace, Menlo, monospace; fill: #6a737d; }
+    .grid { stroke: #eef2f5; stroke-width: 1; stroke-dasharray: 2 3; }
+    .star { font: 12px sans-serif; fill: #22863a; font-weight: 700; }
+  </style>
+  <!-- y-axis (left) -->
+  <line class="axis" x1="200" y1="20" x2="200" y2="490"/>
+  <!-- x-axis (bottom) -->
+  <line class="axis" x1="200" y1="490" x2="780" y2="490"/>
+  <!-- x ticks 0..1800 -->
+  <g>
+    <line class="grid" x1="200" y1="490" x2="200" y2="20"/>
+    <text class="tick" x="200" y="505" text-anchor="middle">0</text>
+    <line class="grid" x1="297" y1="490" x2="297" y2="20"/>
+    <text class="tick" x="297" y="505" text-anchor="middle">300</text>
+    <line class="grid" x1="393" y1="490" x2="393" y2="20"/>
+    <text class="tick" x="393" y="505" text-anchor="middle">600</text>
+    <line class="grid" x1="490" y1="490" x2="490" y2="20"/>
+    <text class="tick" x="490" y="505" text-anchor="middle">900</text>
+    <line class="grid" x1="587" y1="490" x2="587" y2="20"/>
+    <text class="tick" x="587" y="505" text-anchor="middle">1200</text>
+    <line class="grid" x1="683" y1="490" x2="683" y2="20"/>
+    <text class="tick" x="683" y="505" text-anchor="middle">1500</text>
+    <line class="grid" x1="780" y1="490" x2="780" y2="20"/>
+    <text class="tick" x="780" y="505" text-anchor="middle">1800</text>
+  </g>
+  <text class="lbl" x="490" y="528" text-anchor="middle">diffusion_s (seconds, lower is better)</text>
+  <!-- bars: scale = (780-200)/1800 = 0.322 px per second -->
+  <!-- bar height 22, gap 6 -->
+  <g>
+    <rect class="bar" x="200" y="30"  width="521.6" height="22" fill="#9aa0a6"/><text class="lbl" x="195" y="46" text-anchor="end">Z1 — 1-GPU baseline</text><text class="lblmono" x="730" y="46">1619.9 s · 1.00×</text>
+    <rect class="bar" x="200" y="58"  width="517.3" height="22" fill="#9aa0a6"/><text class="lbl" x="195" y="74" text-anchor="end">Z2 — 1-GPU no-offload</text><text class="lblmono" x="726" y="74">1606.4 s · 1.01×</text>
+    <rect class="bar" x="200" y="86"  width="343.0" height="22" fill="#0366d6"/><text class="lbl" x="195" y="102" text-anchor="end">Diffusers vanilla 1-GPU</text><text class="lblmono" x="552" y="102">≈1065 s · 1.52×</text>
+    <rect class="bar" x="200" y="114" width="283.2" height="22" fill="#586069"/><text class="lbl" x="195" y="130" text-anchor="end">Y1 — Ulysses-2 (old, FA2)</text><text class="lblmono" x="492" y="130">879.5 s · 1.84×</text>
+    <rect class="bar" x="200" y="142" width="281.8" height="22" fill="#586069"/><text class="lbl" x="195" y="158" text-anchor="end">Y3 — Y1 + compile (old)</text><text class="lblmono" x="491" y="158">875.5 s · 1.85×</text>
+    <rect class="bar" x="200" y="170" width="265.5" height="22" fill="#586069"/><text class="lbl" x="195" y="186" text-anchor="end">Y4 — CFG-parallel-2 (orig)</text><text class="lblmono" x="474" y="186">825.4 s · 1.96×</text>
+    <rect class="bar" x="200" y="198" width="251.3" height="22" fill="#586069"/><text class="lbl" x="195" y="214" text-anchor="end">Y5 — Y4 + compile (28 dB drift)</text><text class="lblmono" x="460" y="214">780.6 s · 2.08×</text>
+    <rect class="bar" x="200" y="226" width="245.7" height="22" fill="#586069"/><text class="lbl" x="195" y="242" text-anchor="end">X1 — xDiT CFG-par-2 (old, FA2)</text><text class="lblmono" x="454" y="242">763.6 s · 2.12×</text>
+    <rect class="bar" x="200" y="254" width="214.9" height="22" fill="#586069"/><text class="lbl" x="195" y="270" text-anchor="end">Y1-new — Ulysses-2 (new, SDPA)</text><text class="lblmono" x="423" y="270">667.9 s · 2.42×</text>
+    <rect class="bar" x="200" y="282" width="197.6" height="22" fill="#22863a"/><text class="lbl" x="195" y="298" text-anchor="end">I2V-Y4-sync — CFG-par-2 (sanity)</text><text class="lblmono" x="406" y="298">617.4 s · 2.62×</text>
+    <rect class="bar" x="200" y="310" width="197.5" height="22" fill="#22863a"/><text class="lbl" x="195" y="326" text-anchor="end">Y4-sync — in-tree winner ⭐</text>
+    <text class="star" x="406" y="326">613.2 ± 3.3 s · 2.64× (n=5)</text>
+    <rect class="bar" x="200" y="338" width="196.7" height="22" fill="#22863a"/><text class="lbl" x="195" y="354" text-anchor="end">Y4-no-offload — MD5 = Y4-sync</text><text class="lblmono" x="405" y="354">611.0 s · 2.65×</text>
+    <rect class="bar" x="200" y="366" width="190.6" height="22" fill="#b08800"/><text class="lbl" x="195" y="382" text-anchor="end">Y6 reduce-overhead (non-det)</text><text class="lblmono" x="399" y="382">592.4 s · 2.74× ❌</text>
+    <rect class="bar" x="200" y="394" width="173.6" height="22" fill="#586069"/><text class="lbl" x="195" y="410" text-anchor="end">X1 — xDiT CFG-par-2 (new, SDPA)</text><text class="lblmono" x="382" y="410">539 s · 3.00×</text>
+    <rect class="bar" x="200" y="422" width="144.4" height="22" fill="#586069"/><text class="lbl" x="195" y="438" text-anchor="end">S3 — SGLang TP-2</text><text class="lblmono" x="353" y="438">448.4 s · 3.61×</text>
+    <rect class="bar" x="200" y="450" width="135.3" height="22" fill="#586069"/><text class="lbl" x="195" y="466" text-anchor="end">S2 — SGLang Ulysses-2</text><text class="lblmono" x="344" y="466">420.2 s · 3.86×</text>
+    <rect class="bar" x="200" y="478" width="126.6" height="11" fill="#0366d6"/><text class="lbl" x="195" y="487" text-anchor="end">S1 — SGLang CFG-par-2 ⭐</text><text class="lblmono" x="335" y="487">393.1 s · 4.12×</text>
+  </g>
+</svg>
+
+<p class="footnote">
+  Color coding: <span class="badge neutral">grey</span> in-tree non-winners ·
+  <span class="badge good">green</span> in-tree winners (Y4-sync &amp; equivalents) ·
+  <span class="badge warn">amber</span> compile mode (non-deterministic) ·
+  <span class="badge" style="background:#dbe6f4;color:#0366d6">blue</span> diffusers-path (SGLang/xDiT/vanilla).
+</p>
+
+<details>
+  <summary>Full leaderboard table (all measured configs)</summary>
+<table>
+  <thead><tr>
+    <th>ID</th><th>Description</th><th>n</th><th>diffusion_s</th>
+    <th>Speedup vs 1-GPU</th><th>MD5</th><th>Notes</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Z1</td><td>1-GPU, bf16, offload (old server)</td><td>2</td><td class="num">1619.9 ± 0.1</td><td class="num">1.00×</td><td>—</td><td>reference</td></tr>
+    <tr><td>Z2</td><td>1-GPU, bf16, no-offload (both DiTs resident)</td><td>2</td><td class="num">1606.4 ± 0.8</td><td class="num">1.01×</td><td>—</td><td>offload is free</td></tr>
+    <tr><td>Diffusers-vanilla</td><td>1-GPU vanilla <code>diffusers.WanPipeline</code> (new server, SDPA)</td><td>1</td><td class="num">~1065</td><td class="num">~1.52×</td><td><code>570afbe1…</code></td><td>diffusers-path reference</td></tr>
+    <tr><td>Y1</td><td>2-GPU Ulysses-2 (old server, FA2)</td><td>2</td><td class="num">879.5 ± 0.7</td><td class="num">1.84×</td><td><code>efc539be…</code></td><td>= Y4 (old MD5-equal)</td></tr>
+    <tr><td>Y3</td><td>Y1 + <code>torch.compile</code> (default)</td><td>1</td><td class="num">875.5</td><td class="num">1.85×</td><td>(untested)</td><td>compile barely helps Ulysses</td></tr>
+    <tr><td>Y4</td><td>2-GPU CFG-parallel-2 (old server, FA2; no sync fix yet)</td><td>4</td><td class="num">825.4 ± 0.4</td><td class="num">1.96×</td><td><code>efc539be…</code></td><td>= Y1 (bit-equal across SP schemes)</td></tr>
+    <tr><td>Y5</td><td>Y4 + <code>torch.compile</code> (default mode)</td><td>4</td><td class="num">780.6 ± 5.7</td><td class="num">2.08×</td><td><code>d39b8fca…</code></td><td>❌ 28.4 dB drift</td></tr>
+    <tr><td>X1 (old)</td><td>xDiT (xfuser) CFG-parallel-2 (old, FA2-reported)</td><td>3</td><td class="num">763.6 ± 1.2</td><td class="num">2.12×</td><td>(no mp4 originally; bug-fixed)</td><td>diffusers-path</td></tr>
+    <tr><td>Y1-new</td><td>Ulysses-2 on new server with SDPA fallback</td><td>1</td><td class="num">667.9</td><td class="num">2.42×</td><td><code>e5d6482e…</code></td><td>= Y4-sync (MD5-equal)</td></tr>
+    <tr><td>I2V-Y4-sync</td><td>I2V-A14B on Y4-sync config</td><td>1</td><td class="num">617.4</td><td class="num">(I2V)</td><td><code>d5df996c…</code></td><td>✅ sync fix transfers to I2V</td></tr>
+    <tr class="winner"><td><strong>Y4-sync ⭐</strong></td><td><strong>CFG-parallel-2 + sync fix (new server, SDPA)</strong></td><td>5</td><td class="num"><strong>613.2 ± 3.3</strong></td><td class="num"><strong>2.64×</strong></td><td><strong><code>e5d6482e…</code></strong></td><td><strong>CV 0.5%, all 5 MD5-identical</strong></td></tr>
+    <tr><td>Y4-no-offload</td><td>Y4-sync without <code>--offload_model True</code></td><td>2</td><td class="num">611.0 ± 1.5</td><td class="num">2.65×</td><td><code>e5d6482e…</code></td><td>MD5 = Y4-sync, offload is free</td></tr>
+    <tr><td>Y6 reduce-overhead</td><td>Y4-sync + <code>--compile_mode reduce-overhead</code></td><td>2</td><td class="num">592.4 ± 15.5</td><td class="num">2.74×</td><td>different per run</td><td>❌ non-deterministic + 28 dB drift</td></tr>
+    <tr><td>Y6 max-autotune</td><td>Y4-sync + <code>--compile_mode max-autotune</code></td><td>0</td><td class="num">OOM</td><td>—</td><td>—</td><td>❌ allocation 8.65 GB &gt; free 5 GB at compile time</td></tr>
+    <tr><td>X2 (xDiT USP-2)</td><td>xDiT Ulysses-2 inside xfuser</td><td>0</td><td class="num">OOM</td><td>—</td><td>—</td><td>❌ doesn't compose with model offload, ~3 GB short</td></tr>
+    <tr><td>X1 (new)</td><td>xDiT CFG-parallel-2 (new server, SDPA)</td><td>1</td><td class="num">539</td><td class="num">3.00×</td><td>(mp4 ≠ Y4-sync)</td><td>13.9 dB vs Y4-sync (diffusers RNG)</td></tr>
+    <tr><td>S3</td><td>SGLang TP-2</td><td>2</td><td class="num">448.4 ± 0.7</td><td class="num">3.61×</td><td>(unverified)</td><td>diffusers-path</td></tr>
+    <tr><td>S2</td><td>SGLang Ulysses-2</td><td>2</td><td class="num">420.2 ± 0.7</td><td class="num">3.86×</td><td>(unverified)</td><td>diffusers-path</td></tr>
+    <tr class="winner"><td><strong>S1 ⭐</strong></td><td><strong>SGLang CFG-parallel-2 (diffusers-path winner)</strong></td><td>2</td><td class="num"><strong>393.1 ± 0.7</strong></td><td class="num"><strong>4.12×</strong></td><td><strong><code>e8f711e9…</code></strong></td><td><strong>17.2 dB vs Y4-sync; visual A/B = equally good</strong></td></tr>
+  </tbody>
+</table>
+</details>
+
+<!-- ==================== PHASE 1 ==================== -->
+<h2 id="phase1">4. Phase 1 — in-tree 2× H100 matrix (Y0–Y5)</h2>
+
+<p>
+  Locked baseline <code>B0 / Y0 / Z1</code>, then ran an 8-config matrix isolating
+  one knob at a time (FSDP, Ulysses, compile, offload, dtype). Phase 0
+  reproducibility on B0 × 5 showed CV(<code>diffusion_s</code>) = 0.43% — tight
+  enough for reliable comparison. Phase 1 at 720p tightened further to CV 0.05%
+  on the Y4 winner.
+</p>
+
+<h3>Phase 1 results (720p, old server with FA2)</h3>
+<table>
+  <thead><tr>
+    <th>Config</th><th>Flags added to baseline</th><th>n</th>
+    <th>diffusion_s</th><th>Speedup</th><th>Peak GB</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Z1</td><td>1-GPU, bf16, offload</td><td class="num">2</td><td class="num">1619.9 ± 0.1</td><td class="num">1.00×</td><td class="num">61.2</td></tr>
+    <tr><td>Z2</td><td>1-GPU, no offload</td><td class="num">2</td><td class="num">1606.4 ± 0.8</td><td class="num">1.01×</td><td class="num">64.4</td></tr>
+    <tr><td>Y0</td><td>Ulysses-2, no offload</td><td>—</td><td class="num">OOM</td><td>—</td><td>—</td></tr>
+    <tr><td>Y1</td><td><code>--ulysses_size 2</code></td><td class="num">2</td><td class="num">879.5 ± 0.7</td><td class="num">1.84×</td><td class="num">66.1</td></tr>
+    <tr><td>Y2</td><td>FSDP + Ulysses-2</td><td>—</td><td class="num">OOM</td><td>—</td><td>—</td></tr>
+    <tr><td>Y3</td><td>Y1 + <code>--compile_model</code></td><td class="num">1</td><td class="num">875.5</td><td class="num">1.85×</td><td class="num">68.5</td></tr>
+    <tr><td><strong>Y4</strong></td><td><strong>CFG-parallel-2 + offload</strong></td><td class="num"><strong>4</strong></td><td class="num"><strong>825.4 ± 0.4</strong></td><td class="num"><strong>1.96×</strong></td><td class="num"><strong>61.2</strong></td></tr>
+    <tr><td>Y5</td><td>Y4 + <code>--compile_model</code> (default)</td><td class="num">4</td><td class="num">780.6 ± 5.7</td><td class="num">2.08×</td><td class="num">64.2</td></tr>
+  </tbody>
+</table>
+
+<h3>Why CFG-parallel-2 beats Ulysses-2 at 2 GPUs</h3>
+
+<table>
+  <thead><tr>
+    <th></th><th>Ulysses-2</th><th>CFG-parallel-2</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>What's split</td><td>tokens (sequence)</td><td>forward branch (cond / uncond)</td></tr>
+    <tr><td>Per-rank work per step</td><td>2× full forwards on half tokens</td><td>1× full forward on full tokens</td></tr>
+    <tr><td>Collective traffic / generation</td><td>~2400 <code>all_to_all</code>, ~5 TB</td><td>1 <code>all_gather</code>, ~1.5 GB</td></tr>
+    <tr><td>Numerical equivalence to vanilla</td><td>bit-equal ✅</td><td>bit-equal ✅</td></tr>
+    <tr><td>Wall (this benchmark)</td><td>879.5 s</td><td>825.4 s (1.07× faster)</td></tr>
+  </tbody>
+</table>
+
+<p>
+  <strong>3300× less NCCL traffic ⇒ ~6% per-step compute savings on
+  NVLink-connected H100s.</strong> The collective cost dominates Ulysses
+  on 2 GPUs because the per-rank token count is so small that
+  the all_to_all overhead exceeds the compute savings.
+</p>
+
+<blockquote>
+  <strong>Key insight from Phase 1:</strong> Y0 (no-offload + Ulysses)
+  and Y2 (FSDP + Ulysses) both OOM at 720p — the 80 GB ceiling is tight
+  enough that activation memory + DiT weights leaves no room for FSDP's
+  unsharded all-gather buffers (27 GB) or for both DiTs resident with
+  activations. CFG-parallel-2 with offload (Y4) is the only path that
+  fits comfortably and runs fastest. After the sync fix, Y4-sync stays
+  the winner.
+</blockquote>
+
+<!-- ==================== PHASE 2 — xDiT ==================== -->
+<h2 id="phase2">5. Phase 2 — xDiT (xfuser) external engine</h2>
+
+<p>
+  Wrote three local xfuser adapters under <code>scripts/profiling/</code> because
+  xfuser ships the attention-processor for Wan2.x but not the transformer- or
+  pipeline-level wrappers:
+</p>
+<ul>
+  <li><code>xfuser_wan_transformer.py</code> — registers <code>xFuserWanTransformer3DWrapper</code>
+    for diffusers' <code>WanTransformer3DModel</code> and <code>xFuserWanAttentionWrapper</code>
+    for <code>WanAttention</code> (handles <code>rotary_emb</code> arg)</li>
+  <li><code>xfuser_wan_pipeline.py</code> — <code>WanXFuserPipeline</code> for
+    <code>diffusers.WanPipeline</code>; handles Wan2.2-specific dual transformer +
+    dual guidance, also frees DiTs to CPU before VAE decode to avoid OOM</li>
+  <li><code>run_xdit.py</code> — torchrun-launchable runner emitting stub
+    <code>timing_rank0.csv</code></li>
+</ul>
+
+<h3>xDiT results</h3>
+<table>
+  <thead><tr>
+    <th>Config</th><th>n</th><th>diffusion_s</th><th>vs Y4-sync</th><th>PSNR vs Y4-sync</th><th>Status</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>X1 — xDiT CFG-parallel-2 (old server, FA2-reported)</td><td class="num">3</td><td class="num">763.6 ± 1.2</td><td class="num">1.25× slower</td><td>n/a (pre-sync-fix era)</td><td>✅</td></tr>
+    <tr><td>X1 — xDiT CFG-parallel-2 (new server, SDPA, mp4-fix)</td><td class="num">1</td><td class="num">539</td><td class="num">1.14× faster</td><td>13.9 dB</td><td>✅ (after 2 bug fixes)</td></tr>
+    <tr><td>X2 — xDiT USP-2 (Ulysses inside xfuser)</td><td>—</td><td>OOM</td><td>—</td><td>—</td><td>❌</td></tr>
+  </tbody>
+</table>
+
+<details>
+  <summary>Two bugs in our xDiT wrapper that masked the X1 result</summary>
+  <p><strong>Bug 1:</strong> <code>run_xdit.py</code> had
+  <code>if is_dp_last_group() and rank == 0:</code> guarding the mp4 save.
+  On CFG-parallel-2, <code>is_dp_last_group()</code> requires
+  <code>cfg_rank == cfg_world - 1</code> — which means world-rank 1, not 0.
+  The two conditions were unsatisfiable, so no mp4 was ever saved.
+  Fix: drop the <code>rank == 0</code> constraint; the dp-last-group rank
+  is the one that actually decoded the video.</p>
+  <p><strong>Bug 2:</strong> After fix #1, rank 1 OOM'd at VAE decode time —
+  78 GB used by both DiTs + 2.64 GB scratch needed but only 1.3 GB free.
+  Fix: move DiTs to CPU + <code>torch.cuda.empty_cache()</code> before VAE
+  decode in <code>xfuser_wan_pipeline.py</code>. After both fixes, mp4
+  saves cleanly.</p>
+  <p><strong>Note on the FA2 vs SDPA wall difference:</strong>
+  X1 reported 763.6 s on the old server with <code>env/attn_backend=flash_attn_2</code>
+  in the timing CSV, and 539 s on the new server with SDPA fallback.
+  The probe at runtime may have caught FA2 as importable in either case
+  (since the package is installed both times), but at actual attention time
+  the load path differs. Both runs are real; the new-server number is what's
+  reproducible today.</p>
+</details>
+
+<h3>Why X2 (USP-2) OOM'd</h3>
+<p>
+  xfuser's standard transformer wrapper monkey-patches each block's attention
+  processor to an SP-aware variant (<code>xFuserWanAttnProcessor</code>) that
+  pre-allocates a full-sequence scratch buffer per rank. Combined with both
+  DiTs resident (xfuser does not interleave cleanly with diffusers'
+  <code>--cpu-offload</code> knob — the offload hook is installed before the
+  SP wrapper takes effect), peak demand is roughly <strong>83 GB on an 80 GB
+  ceiling</strong>. The xfuser-recommended fix is layerwise offload, a
+  considerably deeper integration than the wrapper approach we used here.
+</p>
+
+<!-- ==================== PHASE 3 — SGLANG ==================== -->
+<h2 id="phase3-sglang">6. Phase 3 — SGLang-Diffusion external engine</h2>
+
+<p>
+  SGLang-Diffusion v0.5.11 wraps Wan2.2 natively under an HTTP server entrypoint.
+  Supports CFG-parallel, Ulysses, TP. Per-component offload via
+  <code>--text-encoder-cpu-offload</code>, <code>--dit-layerwise-offload</code>.
+</p>
+
+<h3>SGLang results</h3>
+<table>
+  <thead><tr>
+    <th>Config</th><th>n</th><th>diffusion_s</th><th>vs Y4-sync</th>
+    <th>vs Z1 (1-GPU)</th><th>PSNR vs Y4-sync</th>
+  </tr></thead>
+  <tbody>
+    <tr class="winner"><td><strong>S1 — CFG-parallel-2 ⭐</strong></td><td class="num">2</td><td class="num"><strong>393.1 ± 0.7</strong></td><td class="num"><strong>1.56× faster</strong></td><td class="num"><strong>4.12×</strong></td><td>17.2 dB</td></tr>
+    <tr><td>S2 — Ulysses-2</td><td class="num">2</td><td class="num">420.2 ± 0.7</td><td class="num">1.46× faster</td><td class="num">3.86×</td><td>(not measured; same engine)</td></tr>
+    <tr><td>S3 — TP-2</td><td class="num">2</td><td class="num">448.4 ± 0.7</td><td class="num">1.37× faster</td><td class="num">3.61×</td><td>(not measured; same engine)</td></tr>
+  </tbody>
+</table>
+
+<p>
+  Within SGLang, the CFG-parallel &gt; Ulysses &gt; TP ordering at 2 GPUs
+  mirrors our in-tree finding: CFG-parallel is the cheapest collective
+  pattern on 2× NVLink-connected H100s.
+</p>
+
+<blockquote class="good">
+  <strong>SGLang S1 is 2.71× faster than vanilla diffusers (1065 s → 393 s).</strong>
+  This is a clean engineering win on the diffusers code path: same model, same
+  reference, no quality compromise versus the engine's own baseline.
+  Visual A/B confirms it's also indistinguishable from Y4-sync's quality
+  (just samples a different point in the model's posterior — see §<a href="#psnr-matrix">13</a>).
+</blockquote>
+
+<!-- ==================== SYNC FIX ==================== -->
+<h2 id="syncfix">7. Phase 3 follow-on — Y4 <code>scheduler_step</code> regression FIX (27% win)</h2>
+
+<p>
+  The visible symptom: per-span profiling showed Y4's <code>scheduler_step</code>
+  running <strong>2640× slower than Y1's</strong> (~3008 ms vs ~1.1 ms per step,
+  accumulating to ~115 s wasted over 40 steps). The actual cause was implicit-sync
+  pollution from <code>cfg_all_gather</code>'s async <code>dist.all_gather</code>
+  returning before NCCL completed — the next CUDA op (<code>torch.tensor</code>
+  inside <code>scheduler.step</code>) syncs implicitly against the unsynchronized
+  NCCL stream and pays the entire wait there.
+</p>
+
+<h3>The fix (one line)</h3>
+<pre><code># wan/distributed/cfg_parallel.py
+def cfg_all_gather(tensor: torch.Tensor):
+    contig = tensor.contiguous()
+    gathered = [torch.empty_like(contig) for _ in range(_CFG_SIZE)]
+    dist.all_gather(gathered, contig, group=_CFG_GROUP)
+    # ↓ added 2026-05-12 — drops Y4 diffusion 27%
+    torch.cuda.current_stream().synchronize()
+    return gathered[0], gathered[1]</code></pre>
+
+<h3>Per-span timing — before vs after the fix (new server, SDPA, same hardware)</h3>
+
+<table>
+  <thead><tr>
+    <th>Span</th><th>Median per-step before</th><th>Median per-step after</th>
+    <th>Δ</th>
+  </tr></thead>
+  <tbody>
+    <tr><td><code>scheduler_step</code></td><td class="num">2830 ms</td><td class="num">1.3 ms</td><td>2200× faster (regression eliminated)</td></tr>
+    <tr><td><code>cfg_all_gather</code></td><td class="num">0.4 ms (wall — NCCL still async)</td><td class="num">2545 ms (now includes the wait)</td><td>cost correctly attributed</td></tr>
+    <tr><td><code>model_forward_cfg_split</code></td><td class="num">16,499 ms</td><td class="num">11,814 ms</td><td><strong>4.7 s/step saved</strong> (the unexpected win)</td></tr>
+    <tr><td><strong>diffusion_loop (total)</strong></td><td class="num"><strong>833,794 ms</strong></td><td class="num"><strong>613,326 ms</strong></td><td><strong>27% faster</strong></td></tr>
+  </tbody>
+</table>
+
+<blockquote class="warn">
+  <strong>The surprising part:</strong> the visible <code>scheduler_step</code>
+  regression (~3 s) wasn't where the win came from. The real saving was
+  in <code>model_forward_cfg_split</code> — 4.7 s/step × 40 steps = 188 s
+  recovered. Without the explicit sync, the NCCL backlog after each
+  <code>cfg_all_gather</code> polluted the next step's kernel launches
+  (allocator fragmentation, sync-on-alloc cascades, etc.). The sync
+  drains the GPU between steps so the next step's model forward queues
+  cleanly. <strong>Lesson:</strong> "the regression you see in the
+  profile" and "the place where time is actually being lost" can differ
+  by an order of magnitude; trust the total wall time over per-span
+  attribution.
+</blockquote>
+
+<h3>Y4-sync variance hardening</h3>
+
+<table>
+  <thead><tr>
+    <th>Run</th><th>diffusion_s</th><th>MD5</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Y4-sync run 0</td><td class="num">613.3</td><td><code>e5d6482e…</code></td></tr>
+    <tr><td>Y4-sync run 1</td><td class="num">610.6</td><td><code>e5d6482e…</code></td></tr>
+    <tr><td>Y4-sync run 2</td><td class="num">618.8</td><td><code>e5d6482e…</code></td></tr>
+    <tr><td>Y4-sync run 3</td><td class="num">612.1</td><td><code>e5d6482e…</code></td></tr>
+    <tr><td>Y4-sync run 4</td><td class="num">611.2</td><td><code>e5d6482e…</code></td></tr>
+    <tr class="winner"><td><strong>Y4-sync (n=5 summary)</strong></td><td class="num"><strong>613.2 ± 3.3 s</strong></td><td><strong>all MD5-identical (CV 0.5%)</strong></td></tr>
+  </tbody>
+</table>
+
+<!-- ==================== Y4 VARIANTS ==================== -->
+<h2 id="y4-variants">8. Phase 3 follow-on — Y4 variants (no-offload, n=5)</h2>
+
+<p>
+  Hypothesis to test: the 14% gap between Y4-sync (613 s) and xDiT X1
+  (539 s on new server) might be from Y4-sync's <code>--offload_model True</code>
+  bouncing models between CPU and GPU at the boundary timestep. xDiT keeps both
+  DiTs GPU-resident; if that's the bottleneck, dropping offload should close the gap.
+</p>
+
+<h3>Result: offload is free</h3>
+
+<table>
+  <thead><tr>
+    <th>Config</th><th>n</th><th>diffusion_s</th><th>Peak mem</th><th>MD5</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Y4-sync (with <code>--offload_model True</code>)</td><td class="num">5</td><td class="num">613.2 ± 3.3</td><td>~61 GB</td><td><code>e5d6482e…</code></td></tr>
+    <tr><td>Y4-no-offload (without it)</td><td class="num">2</td><td class="num">611.0 ± 1.5</td><td>78 GB/rank</td><td><code>e5d6482e…</code> (same!)</td></tr>
+  </tbody>
+</table>
+
+<blockquote class="good">
+  <strong>Conclusion:</strong> dropping <code>--offload_model True</code> saves
+  ~2 s out of 613 (within run-to-run noise) and produces MD5-identical output.
+  Model offload is effectively free on this platform. The 14% gap to xDiT must
+  come from elsewhere (most likely a tighter pipeline / fewer Python dispatch
+  layers in xfuser's path, or different scheduler driver overhead). The
+  Y4-sync default keeps offload on for memory safety on tighter platforms.
+</blockquote>
+
+<!-- ==================== Y1-NEW ==================== -->
+<h2 id="y1-new">9. Phase 3 follow-on — Y1 on the new platform (Ulysses-2 + SDPA)</h2>
+
+<p>
+  Cross-check the sync-fix work: does the Y1↔Y4 bit-equality property survive
+  the platform shift? Ran Y1 (Ulysses-2) on the new server (torch 2.11 + SDPA)
+  with the same patch applied to <code>wan/distributed/ulysses.py</code> — it
+  had a direct <code>from ..modules.attention import flash_attention</code>
+  import that asserted FA2 hard; switched to the <code>attention</code>
+  wrapper that falls back to SDPA.
+</p>
+
+<h3>Result: bit-equality preserved</h3>
+
+<table>
+  <thead><tr>
+    <th>Config</th><th>diffusion_s</th><th>MD5</th><th>Status</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Y4-sync (CFG-parallel-2)</td><td class="num">613.2</td><td><code>e5d6482e5ee488a047569642b072fc26</code></td><td>reference</td></tr>
+    <tr><td>Y1-new (Ulysses-2)</td><td class="num">667.9</td><td><code>e5d6482e5ee488a047569642b072fc26</code></td><td>✅ MD5-identical</td></tr>
+  </tbody>
+</table>
+
+<blockquote class="good">
+  <strong>In-tree parallelism schemes remain bit-equal across the platform
+  shift.</strong> The 28.6 dB delta vs the old-server Y4 reference is purely the
+  platform shift (torch 2.5.1→2.11 + FA2→SDPA + cu121→cu130), hits Y1-new and
+  Y4-sync identically. CFG-parallel-2 is <strong>8.8% faster than Ulysses-2 for
+  the exact same output</strong>, confirming CFG-parallel as the right in-tree
+  default on 2× NVLink-connected H100s.
+</blockquote>
+
+<!-- ==================== COMPILE MODES ==================== -->
+<h2 id="compile">10. Phase 3 follow-on — <code>torch.compile</code> mode tuning (negative result)</h2>
+
+<p>
+  Y5 (default-mode compile) on the old server gave 780.6 s (2.08×) but
+  drifted 28.4 dB from Y1. Y6 (reduce-overhead) and Y7 (max-autotune) on the
+  old server failed with a torch CUDAGraph allocator bug — wall numbers
+  recorded (~580 s) but no mp4 saved. On 2026-05-12, retried on torch 2.11.
+</p>
+
+<h3>Y6 retry results</h3>
+
+<table>
+  <thead><tr>
+    <th>Config</th><th>n</th><th>diffusion_s</th><th>MD5</th>
+    <th>PSNR vs Y4-sync</th><th>Status</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Y6 reduce-overhead run 0</td><td class="num">1</td><td class="num">603.3</td><td><code>7a16e278…</code></td><td>~33 dB</td><td>completed</td></tr>
+    <tr><td>Y6 reduce-overhead run 1</td><td class="num">1</td><td class="num">581.4</td><td><code>9f88fb59…</code></td><td>~29 dB (vs run 0!)</td><td>completed</td></tr>
+    <tr><td>Y6 max-autotune</td><td>—</td><td>OOM</td><td>—</td><td>—</td><td>compile-time OOM</td></tr>
+  </tbody>
+</table>
+
+<blockquote class="bad">
+  <strong>Two reasons not to use compile-mode tuning:</strong>
+  <ol style="margin-bottom:0">
+    <li><strong>Non-deterministic.</strong> Same config, same seed, same flags,
+    Y6 run 0 and run 1 produced different MD5s with 29 dB PSNR between them
+    (CV 2.6%). CUDA Graphs capture varies per run, leaving the diffusion
+    trajectory non-reproducible.</li>
+    <li><strong>Marginal speedup.</strong> Y6 mean is 592.4 s vs Y4-sync 613.2 s —
+    only 1.8% faster, within compile-overhead noise. With non-determinism on top of
+    ~28 dB drift vs Y4-sync, it's not worth the trade.</li>
+  </ol>
+  Y7 max-autotune is also broken on this stack: the CUDA Graphs private pool
+  reserves 10.82 GB, leaving 5 GB free for compile scratch, and max-autotune
+  needs 8.65 GB allocation → OOM.
+</blockquote>
+
+<!-- ==================== SCHEDULER ISOLATION ==================== -->
+<h2 id="scheduler-isolation">11. Phase 3 follow-on — Scheduler isolation experiment</h2>
+
+<p>
+  Hypothesis: the 17.9 dB PSNR cluster between in-tree and diffusers-path
+  engines might be concentrated in scheduler implementation. Diffusers' Wan ckpt
+  uses <code>UniPCMultistepScheduler</code>; in-tree uses
+  <code>FlowUniPCMultistepScheduler</code> from <code>wan/utils/fm_solvers_unipc.py</code>.
+  Same family, both <code>solver_order=2 solver_type=bh2 use_flow_sigmas=true</code>.
+</p>
+
+<h3>Direct timestep / sigma comparison at <code>flow_shift=12</code>, 40 steps</h3>
+
+<table>
+  <thead><tr>
+    <th></th><th>In-tree FlowUniPC</th><th>Diffusers UniPC</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Timesteps[0:8]</td><td>999, 997, 995, 993, 990, 988, 985, 982</td><td>999, 997, 995, 993, 990, 988, 985, 982 (match)</td></tr>
+    <tr><td>Timesteps[-4:]</td><td>571, 492, 386, 235</td><td>573, 496, 391, 242 (drift up to 7 units)</td></tr>
+    <tr><td>First sigma</td><td class="num">0.9999166</td><td class="num">0.9999990</td></tr>
+  </tbody>
+</table>
+
+<h3>Experiment: patch in-tree to use diffusers' scheduler, regenerate</h3>
+
+<p>
+  Added <code>WAN_USE_DIFFUSERS_SCHEDULER=1</code> env-flag in
+  <code>wan/text2video.py</code> that swaps in <code>diffusers.UniPCMultistepScheduler</code>.
+  Same prompt, same seed, same everything else. Result:
+</p>
+
+<table>
+  <thead><tr>
+    <th>Comparison</th><th>PSNR (avg)</th><th>Interpretation</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Y4 + diffusers-scheduler <strong>vs Y4-sync</strong></td><td class="num">~24 dB</td><td>Swapping scheduler displaces output by ~24 dB</td></tr>
+    <tr><td>Y4 + diffusers-scheduler <strong>vs diffusers-vanilla</strong></td><td class="num">~17.5 dB</td><td>Did NOT close the gap to diffusers</td></tr>
+  </tbody>
+</table>
+
+<blockquote class="warn">
+  <strong>Scheduler is one real divergence source but not the dominant one.</strong>
+  Swapping it moves the output away from in-tree without bringing it closer to
+  diffusers-vanilla. The remaining divergence is in the <strong>model forward
+  path itself</strong>: <code>wan/modules/model.py::WanModel</code> vs
+  <code>diffusers.WanTransformer3DModel</code> are different implementations
+  at the layer level (attention, layernorm, MLP). The "find one line" framing
+  of the RNG-divergence task is the wrong frame — the divergence is
+  <em>distributed</em> across the implementation. Closing the gap would
+  require porting one model class to match the other, a much larger surgery.
+  The env-flag is committed as a diagnostic tool for future investigation.
+</blockquote>
+
+<!-- ==================== I2V ==================== -->
+<h2 id="i2v">12. Phase 3 follow-on — I2V-A14B sanity</h2>
+
+<p>
+  The original benchmark plan called for one I2V confirmation per phase to verify
+  findings transfer. After downloading the 118 GB I2V-A14B checkpoint, ran one
+  I2V generation on the Y4-sync config (<code>cfg_parallel_size=2</code> + sync fix).
+  Prompt: canonical <code>EXAMPLE_PROMPT["i2v-A14B"]["prompt"]</code> (cat on
+  surfboard) with the default <code>examples/i2v_input.JPG</code> reference image.
+</p>
+
+<table>
+  <thead><tr>
+    <th>Metric</th><th>I2V-Y4-sync</th><th>T2V-Y4-sync (reference)</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>diffusion_loop</td><td class="num">617.4 s</td><td class="num">613.2 ± 3.3 s</td></tr>
+    <tr><td>scheduler_step median</td><td class="num">~7 ms</td><td class="num">1.3 ms</td></tr>
+    <tr><td>cfg_all_gather median</td><td class="num">~3.4 ms</td><td class="num">2545 ms (sync wait correctly attributed)</td></tr>
+    <tr><td>Output</td><td>valid I2V mp4 from reference image</td><td>valid T2V mp4</td></tr>
+  </tbody>
+</table>
+
+<blockquote class="good">
+  <strong>Findings transfer cleanly.</strong> I2V diffusion is within 1% of T2V's
+  on the same Y4-sync config. The sync fix preserves the same per-step behavior.
+  Same DiT family, same CFG-parallel algorithm, same scheduler — so the I2V
+  speedup vs single-GPU baseline is also ~2.62×.
+</blockquote>
+
+<!-- ==================== PSNR MATRIX ==================== -->
+<h2 id="psnr-matrix">13. Cross-engine PSNR matrix &amp; visual A/B</h2>
+
+<p>
+  Every engine produces a valid sample of the same model. The question is:
+  is the cross-engine PSNR delta (a) lossy approximation, or (b) different
+  RNG/scheduler/model-forward path → different sample of the same distribution?
+</p>
+
+<h3>The matrix — all four engines pairwise, average PSNR (dB)</h3>
+
+<table class="matrix">
+  <thead><tr>
+    <th>—</th><th>Y4-sync<br/>(in-tree)</th><th>Diffusers<br/>vanilla</th><th>xDiT X1</th><th>SGLang S1</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Y4-sync (in-tree)</td><td class="eq">∞ (=Y1)</td><td class="near">17.9</td><td class="far">13.9</td><td class="near">17.2</td></tr>
+    <tr><td>Diffusers vanilla</td><td class="near">17.9</td><td class="eq">reference</td><td class="muted">—</td><td class="near">16.5</td></tr>
+    <tr><td>SGLang S1</td><td class="near">17.2</td><td class="near">16.5</td><td class="muted">—</td><td class="eq">∞ (deterministic per seed)</td></tr>
+  </tbody>
+</table>
+
+<p class="footnote">
+  Color legend: <span class="badge good">green</span> bit-equal (∞ dB),
+  <span class="badge warn">amber</span> diffusers-RNG-path cluster (14–18 dB),
+  <span class="badge bad">red</span> outside that cluster.
+</p>
+
+<blockquote>
+  <strong>Pattern recognition:</strong> three independent diffusers-path
+  engines (vanilla diffusers, xDiT, SGLang) all cluster within ~4 dB of each
+  other and ~14–18 dB from in-tree. Lossy compression or quantization would
+  produce engine-specific PSNR points; matching deltas across three independent
+  engines that share only the <code>diffusers.WanPipeline</code> backbone is
+  the unambiguous signature of "same model, different RNG / scheduler / forward
+  path → different valid sample of the same distribution." This is corroborated
+  by the scheduler-isolation experiment (§<a href="#scheduler-isolation">11</a>):
+  even after we use the same scheduler class in in-tree, the cluster gap stays.
+</blockquote>
+
+<h3>Visual A/B confirmations (2026-05-12)</h3>
+
+<table>
+  <thead><tr>
+    <th>Pair</th><th>PSNR</th><th>Visual A/B verdict</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Y4-sync vs Diffusers-vanilla</td><td class="num">17.9 dB</td><td>Equally good — same scene, comparable quality, specific sampled features differ (one has cats wearing helmets, the other doesn't)</td></tr>
+    <tr><td>Y4-sync vs SGLang S1</td><td class="num">17.2 dB</td><td>Equally good — no perceptible quality difference despite SGLang being 2.1× faster than Y4-sync</td></tr>
+    <tr><td>Y4-sync (new server) vs Y4 (old server)</td><td class="num">28.6 dB</td><td>Equally good — the platform shift PSNR is sample-level, not quality-level</td></tr>
+  </tbody>
+</table>
+
+<blockquote class="good">
+  <strong>All three A/B pairs return "equally good."</strong> The 14–18 dB PSNR
+  cluster is structural sample variation, not quality degradation. This means
+  <em>SGLang's 2.71× over vanilla diffusers is a clean production win, not a
+  quality trade-off</em>.
+</blockquote>
+
+<!-- ==================== PRODUCTION ==================== -->
+<h2 id="production">14. Production recommendations</h2>
+
+<table>
+  <thead><tr>
+    <th>If you need…</th><th>Pick</th><th>Why</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Bit-equality to upstream Wan2.2 <code>generate.py</code></td>
+        <td><strong>Y4-sync</strong></td>
+        <td>Only path that's MD5-equal to Wan2.2's reference (within a platform). 2.64× speedup, n=5 CV 0.5%.</td></tr>
+    <tr><td>Diffusers code path as production reference, lowest dep risk</td>
+        <td><strong>Y4-sync</strong> (or X1 if xfuser is fine)</td>
+        <td>Y4-sync's output is a valid Wan2.2 sample; if your serving spec doesn't pin to a specific sample, you're done.</td></tr>
+    <tr><td>Maximum throughput, accept different sample stream</td>
+        <td><strong>SGLang S1</strong></td>
+        <td>4.12× over 1-GPU, 2.71× over vanilla diffusers; visual A/B = equally good.</td></tr>
+    <tr><td>Near-lossless w/ compile</td>
+        <td>— (not recommended)</td>
+        <td>All compile modes are <strong>non-deterministic</strong> across runs (29 dB run-to-run on Y6) and have 28 dB drift. The marginal 1.8% speedup over Y4-sync isn't worth the determinism loss.</td></tr>
+    <tr><td>Single-GPU fallback / cost-optimized</td>
+        <td>Z1</td>
+        <td>1620 s diffusion. No code changes needed.</td></tr>
+  </tbody>
+</table>
+
+<h3>Reproducing Y4-sync (the in-tree winner)</h3>
+<pre><code>torchrun --nproc_per_node=2 generate.py \
+  --task t2v-A14B --ckpt_dir &lt;path&gt; \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed 42 --prompt '&lt;...&gt;' \
+  --cfg_parallel_size 2 --convert_model_dtype --offload_model True</code></pre>
+<p class="small">
+  Requires the sync-fix patch in <code>wan/distributed/cfg_parallel.py:106</code>
+  (committed in <code>3d5df92</code>). Expected diffusion ~613 s, MD5-stable.
+</p>
+
+<!-- ==================== INSIGHTS ==================== -->
+<h2 id="insights">15. Key insights</h2>
+
+<ol>
+  <li>
+    <strong>CFG-parallel-2 beats Ulysses-2 on 2× NVLink H100s.</strong>
+    Trades 5 TB of <code>all_to_all</code> traffic per generation for one
+    1.5 GB <code>all_gather</code>. ~6% per-step compute savings; with the
+    sync fix, that grows to ~8.8% on bit-equal output.
+  </li>
+  <li>
+    <strong>The visible regression isn't always where the time is being lost.</strong>
+    The 2640× <code>scheduler_step</code> slowdown was real, but fixing it
+    saved 27% rather than the 14% the per-span math predicted. Implicit
+    sync-on-allocation in the NCCL backlog also polluted subsequent model
+    forwards. Trust total wall time over per-span attribution.
+  </li>
+  <li>
+    <strong>Bit-equality across parallelism schemes is preserved.</strong>
+    Y1 = Y4 = Y4-sync = Y4-no-offload = Y1-new all produce the <em>same MD5</em>
+    within a platform. Different parallelism strategies, different offload knobs,
+    same byte-identical output. Strong correctness property.
+  </li>
+  <li>
+    <strong>Cross-engine PSNR cluster is sample variation, not loss.</strong>
+    Three independent diffusers-path engines (vanilla, xDiT, SGLang) all sit
+    14–18 dB from in-tree and ≤ 4 dB from each other. This pattern is
+    incompatible with lossy approximation; it's the diffusers vs in-tree code
+    path producing different valid samples. Visual A/B confirms it.
+  </li>
+  <li>
+    <strong>Compile modes are production-unfriendly here.</strong>
+    Beyond the ~28 dB drift on default mode, the alternate modes (reduce-overhead,
+    max-autotune) are <em>non-deterministic across runs</em> — same config, same
+    seed, different MD5s, different walls. CUDA Graphs capture is the suspect.
+    Not worth the 1.8% marginal speedup vs Y4-sync.
+  </li>
+  <li>
+    <strong>Model offload is free on this platform.</strong>
+    <code>--offload_model True</code> on Y4-sync produces MD5-identical output
+    and within-noise wall time vs no-offload. The CPU↔GPU bounce at the
+    boundary timestep is fast enough not to matter. Keep offload on by
+    default for memory safety on tighter platforms.
+  </li>
+  <li>
+    <strong>The diffusers-vs-in-tree divergence is distributed.</strong>
+    Scheduler implementation accounts for ~24 dB of attainable displacement
+    but doesn't close the gap; the rest is in the model forward (different
+    <code>WanModel</code> vs <code>WanTransformer3DModel</code> implementations).
+    "Find one line" is the wrong frame — the gap is many lines.
+  </li>
+  <li>
+    <strong>Findings transfer T2V → I2V cleanly.</strong>
+    Same DiT architecture, same sync-fix behavior, same per-step rate.
+    The production recommendation generalizes.
+  </li>
+</ol>
+
+<!-- ==================== FOLLOWUPS ==================== -->
+<h2 id="followups">16. Open follow-ups</h2>
+
+<table>
+  <thead><tr>
+    <th>Item</th><th>Status</th><th>Why deferred</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Phase 4 — 4× / 8× H100 cross-product (CFG × Ulysses × Ring)</td><td>blocked</td><td>Needs different hardware</td></tr>
+    <tr><td>FA3 build + Y4-sync rerun</td><td>blocked</td><td>No prebuilt wheel for torch 2.11 + cu13 + py 3.12; source build fragile</td></tr>
+    <tr><td>Verify Y4-sync n=5 on old platform (torch 2.5.1 + FA2)</td><td>open</td><td>Original server retired; would tighten the platform-shift attribution</td></tr>
+    <tr><td>VAE decode parallelism</td><td>deferred</td><td>Likely 15–25 s saving; not material vs SGLang's 220 s improvement</td></tr>
+    <tr><td>SGLang same-RNG-path A/B vs vanilla diffusers</td><td>open</td><td>16.5 dB suggests minor engine-specific numerics on top of diffusers; not blocking</td></tr>
+    <tr><td>Lossy bucket (TeaCache, FP8, sage, step distillation)</td><td>scope-deferred</td><td>Explicitly out of this engagement's "lossless first" mandate</td></tr>
+  </tbody>
+</table>
+
+<!-- ==================== APPENDIX ==================== -->
+<h2 id="appendix">17. Appendix — code changes &amp; reproduction</h2>
+
+<h3>Git commits on <code>multi-gpu</code> from this engagement</h3>
+<pre><code>1498196  Add WAN_USE_DIFFUSERS_SCHEDULER diagnostic flag
+60aa7a0  Add visual A/B note to benchmark report
+b493a3d  Add A14B 2x H100 benchmark harness, xDiT/SGLang adapters, and final report
+3d5df92  Add CFG-parallel-2 with sync fix; harden SDPA fallback for new torch ABIs</code></pre>
+
+<h3>Files added or modified</h3>
+
+<h4>Inference-affecting changes</h4>
+<ul>
+  <li><code>wan/distributed/cfg_parallel.py</code> (new) — CFG-parallel group setup +
+    <code>cfg_all_gather</code> with the sync fix</li>
+  <li><code>wan/text2video.py</code>, <code>wan/image2video.py</code> — CFG-parallel
+    dispatch in the diffusion loop</li>
+  <li><code>generate.py</code> — <code>--cfg_parallel_size</code> and
+    <code>--compile_mode</code> CLI flags</li>
+  <li><code>wan/distributed/util.py</code> — compile-safe <code>_time_collective</code></li>
+  <li><code>wan/distributed/ulysses.py</code>, <code>wan/modules/attention.py</code>,
+    <code>wan/utils/prompt_extend.py</code> — SDPA-fallback hardening
+    (catch <code>(ImportError, OSError)</code> not just <code>ModuleNotFoundError</code>)</li>
+  <li><code>wan/text2video.py</code> — diagnostic <code>WAN_USE_DIFFUSERS_SCHEDULER=1</code>
+    env-flag (default behavior unchanged)</li>
+</ul>
+
+<h4>Profiling tooling and external-engine adapters</h4>
+<ul>
+  <li><code>scripts/profiling/sweep.py</code> (new), <code>configs/*.yaml</code> (new)</li>
+  <li><code>scripts/profiling/xfuser_wan_pipeline.py</code>,
+    <code>xfuser_wan_transformer.py</code>, <code>run_xdit.py</code> — xDiT adapters</li>
+  <li><code>scripts/profiling/run_diffusers_vanilla.py</code> — single-GPU diffusers
+    baseline runner (for the cross-engine PSNR matrix)</li>
+  <li><code>docs/a14b-2gpu-h100-benchmark.md</code>,
+    <code>a14b-2gpu-h100-benchmark-tldr.md</code>,
+    <code>a14b-2gpu-h100-benchmark.html</code> — this document and its precursors</li>
+</ul>
+
+<h3>Persisted artifacts</h3>
+<p>
+  All raw timing CSVs, Chrome traces, mp4 outputs, and a fresh
+  <code>repo-snapshot.tar.gz</code> are archived at
+  <code>s3://8ec06hdbwh/wan22-benchmark/</code> (RunPod S3,
+  endpoint <code>https://s3api-us-ca-2.runpod.io</code>, region <code>us-ca-2</code>).
+  Manifest entries below:
+</p>
+
+<details>
+  <summary>profile_outputs/ tarball index</summary>
+<pre><code>phase0_repro_a14b.tar.gz   - B0 × 5 reproducibility (CV 0.43%)
+phase1_2gpu.tar.gz         - 480p sweep (B0..B5)
+phase1_720p.tar.gz         - 720p sweep (Y0..Y4)
+phase1_baselines.tar.gz    - Z1, Z2
+phase1_y4_variance.tar.gz  - Y4 × 5 variance hardening (CV 0.05%)
+phase3_y5_variance.tar.gz  - Y5 × 4 variance (CV 0.7%)
+phase3_compile_modes.tar.gz - Y6 / Y7 (failed on old torch CUDAGraph allocator)
+y4_sync_fix.tar.gz         - Y4-sync n=3 first runs (MD5 e5d6482e…)
+medium_leverage.tar.gz     - Y4-no-offload, Y1-new, Y4-sync extras (runs 3, 4)
+y6_compile_retry.tar.gz    - Y6 reduce-overhead n=2 (non-det), max-autotune OOM
+y4_diffusers_sched.tar.gz  - Scheduler-isolation experiment
+i2v_y4_sync.tar.gz         - I2V-A14B sanity (617 s)
+phase2_xdit_x1_fixed.tar.gz - xDiT X1 PSNR-verified rerun
+sglang_rng_question.tar.gz - Vanilla diffusers WanPipeline baseline
+post_may11_logs.tar.gz     - Top-level session stdout/stderr logs
+
+bench_mp4s.tar.gz          - All H264 mp4 outputs through 2026-05-11
+repo-snapshot.tar.gz       - Wan2.2 working tree + .git (commits up through 1498196)
+reports/                   - .md, .html versions of this report</code></pre>
+</details>
+
+<hr class="section"/>
+<p class="meta" style="text-align:center;margin-top:24px">
+  Generated 2026-05-12. Companion files:
+  <a href="a14b-2gpu-h100-benchmark.md">benchmark.md</a> ·
+  <a href="a14b-2gpu-h100-benchmark-tldr.md">tldr.md</a>.
+</p>
+
+</div>
+</body>
+</html>

@@ -42,6 +42,8 @@
 
 If you require bit-equality to in-tree Wan2.2: only **Y4** qualifies. If your serving reference is `diffusers.WanPipeline`: **SGLang S1** at 393 s is **2.71× faster than vanilla diffusers** with no extra quality loss beyond what diffusers itself does. The decision is which code path you bind to.
 
+**Visual A/B confirmed (2026-05-12)**: Y4-sync, diffusers-vanilla, SGLang S1, and old-server-Y4 all look equally good. The 14-18 dB PSNR cluster is structural sample variation (different helmets, different specific details) — not quality degradation. SGLang's 2.71× over diffusers-vanilla is therefore a clean production win, not a quality trade-off.
+
 ## Why CFG-parallel beats Ulysses
 
 | | Ulysses-2 | CFG-parallel-2 |
