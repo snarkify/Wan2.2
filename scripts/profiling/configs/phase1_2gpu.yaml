@@ -1,0 +1,78 @@
+# Phase 1 — In-repo concurrency matrix on 2× H100 (T2V-A14B).
+#
+# 8 configs × 3 runs (skip_first → 2 measured each) ≈ 16 generations.
+# Locked input: 832*480 · frame_num=81 · sample_steps=40 · seed=42.
+# Each run ~2 min on 2× H100 → ~30-50 min wall total.
+#
+# IMPORTANT: HuggingFace ships A14B weights as fp32 (54 GB per DiT, 108 GB total).
+# Non-FSDP configs MUST set --convert_model_dtype to cast to bf16 (53 GB total),
+# else they OOM on H100 80GB. FSDP handles dtype via MixedPrecision internally.
+#
+# Decision after Phase 1: pick winner W1 (lowest diffusion_s) for Phase 2 reference.
+
+defaults:
+  task: t2v-A14B
+  ckpt_dir: /workspace/Wan2.2-T2V-A14B
+  size: "832*480"
+  frame_num: 81
+  sample_steps: 40
+  prompt: "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+  base_seed: 42
+  out_root: /workspace/profile_outputs/phase1_2gpu
+  runs: 3
+  skip_first: true
+
+env_defaults:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_CACHE_DIR: /workspace/.compile_cache
+  WAN_PROFILE_FLUSH_INTERVAL: "1"
+  WAN_PROFILE_GPU_SAMPLER: "1"
+  WAN_PROFILE_GPU_SAMPLE_MS: "100"
+
+configs:
+  # B0: Reference. bf16 (explicit cast at load), Ulysses-2, no FSDP, no offload.
+  # Both DiTs resident (~53 GB params), Ulysses splits attention.
+  - name: B0_uly2_bf16
+    nproc: 2
+    args: ["--ulysses_size", "2", "--convert_model_dtype"]
+
+  # B1: Ulysses-2 + offload, fp32 weights kept on disk-side. Tests whether
+  # per-boundary CPU↔GPU swap of fp32 weights (54 GB PCIe) is an acceptable
+  # alternative to upfront bf16 cast. Expected: slower than B0 by ~10s.
+  - name: B1_uly2_offload_fp32
+    nproc: 2
+    args: ["--ulysses_size", "2", "--offload_model", "True"]
+
+  # B2: Pure FSDP (no Ulysses). Halves param resident via shard;
+  # MixedPrecision casts to bf16 during forward, shards stored as fp32.
+  # Quantifies all-gather cost when memory isn't tight on 80 GB cards.
+  - name: B2_fsdp
+    nproc: 2
+    args: ["--dit_fsdp", "--t5_fsdp"]
+
+  # B3: FSDP + Ulysses-2. tests/test.sh-recommended; combined collective cost.
+  - name: B3_fsdp_uly2
+    nproc: 2
+    args: ["--dit_fsdp", "--t5_fsdp", "--ulysses_size", "2"]
+
+  # B4: B0 + torch.compile. Expect ~15-20% diffusion speedup from prior 5B data.
+  - name: B4_uly2_bf16_compile
+    nproc: 2
+    args: ["--ulysses_size", "2", "--convert_model_dtype", "--compile_model"]
+
+  # B5: FSDP + Ulysses-2 + compile. Does compile compose with FSDP1 FlatParameter?
+  # Risk: graph breaks. May fail; if so, treat as a known-bad combo.
+  - name: B5_fsdp_uly2_compile
+    nproc: 2
+    args: ["--dit_fsdp", "--t5_fsdp", "--ulysses_size", "2", "--compile_model"]
+
+  # B6: B0 + explicit offload_model. Negative control: cost of offloading
+  # when memory headroom exists on H100 80 GB. Expected: slower than B0.
+  - name: B6_uly2_bf16_offload
+    nproc: 2
+    args: ["--ulysses_size", "2", "--convert_model_dtype", "--offload_model", "True"]
+
+  # B7: B0 + t5_cpu. Slower text_encoding (CPU T5), diffusion unchanged.
+  - name: B7_uly2_bf16_t5cpu
+    nproc: 2
+    args: ["--ulysses_size", "2", "--convert_model_dtype", "--t5_cpu"]

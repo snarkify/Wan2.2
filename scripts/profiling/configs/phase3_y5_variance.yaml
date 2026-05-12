@@ -1,0 +1,27 @@
+# Phase 3 — Y5 variance hardening (CFG-parallel + compile, default mode).
+# Current Y5 has n=2; harden to n=4 to lock the 2.08× claim.
+#
+# 1 config × 5 runs (skip_first → n=4 measured) ≈ ~85 min wall.
+
+defaults:
+  task: t2v-A14B
+  ckpt_dir: /workspace/Wan2.2-T2V-A14B
+  size: "1280*720"
+  frame_num: 81
+  sample_steps: 40
+  prompt: "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+  base_seed: 42
+  out_root: /workspace/profile_outputs/phase3_y5_variance
+  runs: 5
+  skip_first: true
+
+env_defaults:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_CACHE_DIR: /workspace/.compile_cache
+  WAN_PROFILE_FLUSH_INTERVAL: "1"
+
+configs:
+  - name: Y5_cfg2_bf16_offload_compile
+    nproc: 2
+    args: ["--cfg_parallel_size", "2", "--convert_model_dtype",
+           "--offload_model", "True", "--compile_model"]

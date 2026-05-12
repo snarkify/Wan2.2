@@ -1,0 +1,37 @@
+# Phase 1 — remaining configs after the util.py compile-events bugfix.
+# Reuses the same out_root so sweep_results.csv continues alongside earlier runs.
+
+defaults:
+  task: t2v-A14B
+  ckpt_dir: /workspace/Wan2.2-T2V-A14B
+  size: "832*480"
+  frame_num: 81
+  sample_steps: 40
+  prompt: "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+  base_seed: 42
+  out_root: /workspace/profile_outputs/phase1_2gpu
+  runs: 3
+  skip_first: true
+
+env_defaults:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_CACHE_DIR: /workspace/.compile_cache
+  WAN_PROFILE_FLUSH_INTERVAL: "1"
+  WAN_PROFILE_GPU_SAMPLER: "1"
+
+configs:
+  - name: B4_uly2_bf16_compile
+    nproc: 2
+    args: ["--ulysses_size", "2", "--convert_model_dtype", "--compile_model"]
+
+  - name: B5_fsdp_uly2_compile
+    nproc: 2
+    args: ["--dit_fsdp", "--t5_fsdp", "--ulysses_size", "2", "--compile_model"]
+
+  - name: B6_uly2_bf16_offload
+    nproc: 2
+    args: ["--ulysses_size", "2", "--convert_model_dtype", "--offload_model", "True"]
+
+  - name: B7_uly2_bf16_t5cpu
+    nproc: 2
+    args: ["--ulysses_size", "2", "--convert_model_dtype", "--t5_cpu"]

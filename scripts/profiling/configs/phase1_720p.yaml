@@ -1,0 +1,64 @@
+# Phase 1 — 720p production-resolution matrix on 2× H100 (T2V-A14B).
+#
+# 720p activations are ~2.3× the 480p ones (seq_len 32K → 75K patches).
+# At 80 GB H100 with both DiTs resident (54 GB), only ~10 GB headroom for
+# activations + T5 transient peak — very tight. Configs that fit:
+#   - Offload paths (1 DiT GPU-resident at a time, ~27 GB headroom freed).
+#   - FSDP paths (similar to 480p B3 which was 73 GB peak; +5 GB activations
+#     puts it ~78 GB, borderline).
+#
+# Per-step compute roughly scales linearly with seq_len → ~14 s/step instead
+# of 6 s. Each run ~11 min. 4 configs × 3 runs ≈ ~2.2 hr wall.
+
+defaults:
+  task: t2v-A14B
+  ckpt_dir: /workspace/Wan2.2-T2V-A14B
+  size: "1280*720"
+  frame_num: 81
+  sample_steps: 40
+  prompt: "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+  base_seed: 42
+  out_root: /workspace/profile_outputs/phase1_720p
+  runs: 3
+  skip_first: true
+
+env_defaults:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_CACHE_DIR: /workspace/.compile_cache
+  WAN_PROFILE_FLUSH_INTERVAL: "1"
+  WAN_PROFILE_GPU_SAMPLER: "1"
+
+configs:
+  # Y0: Same as 480p B0 (Ulysses-2 + bf16, no offload) — tells us how close
+  # we are to the ceiling at 720p. Likely OOMs during T5+DiT co-residency
+  # at init; if it survives that, diffusion peak is ~78 GB.
+  - name: Y0_uly2_bf16
+    nproc: 2
+    args: ["--ulysses_size", "2", "--convert_model_dtype"]
+
+  # Y1: Ulysses-2 + bf16 + offload. Only one DiT on GPU at a time (~27 GB),
+  # leaves comfortable room for 720p activations. Safe baseline. Pays the
+  # cost of one PCIe swap at the boundary.
+  - name: Y1_uly2_bf16_offload
+    nproc: 2
+    args: ["--ulysses_size", "2", "--convert_model_dtype", "--offload_model", "True"]
+
+  # Y2: FSDP + Ulysses-2 at 720p. At 480p B3 was 73 GB peak; +5 GB activations
+  # at 720p puts us ~78 GB. Borderline; may work if NCCL slack is reusable.
+  - name: Y2_fsdp_uly2
+    nproc: 2
+    args: ["--dit_fsdp", "--t5_fsdp", "--ulysses_size", "2"]
+
+  # Y3: Y1 + compile. Offload's 27 GB headroom should accommodate inductor
+  # scratch (B4 OOMed at 480p because there was only 5 GB headroom; here
+  # we have ~30 GB). The lossless-stack candidate at 720p.
+  - name: Y3_uly2_bf16_offload_compile
+    nproc: 2
+    args: ["--ulysses_size", "2", "--convert_model_dtype", "--offload_model", "True", "--compile_model"]
+
+  # Y4: CFG-parallel-2 + bf16 + offload. Each rank runs one CFG branch (cond
+  # OR uncond) at full sequence (no Ulysses split). One DiT GPU-resident
+  # via offload. Peak ~27 GB DiT + ~23 GB full activations = 50 GB. Fits.
+  - name: Y4_cfg2_bf16_offload
+    nproc: 2
+    args: ["--cfg_parallel_size", "2", "--convert_model_dtype", "--offload_model", "True"]

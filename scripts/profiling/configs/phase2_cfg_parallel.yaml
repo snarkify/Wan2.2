@@ -1,0 +1,50 @@
+# Phase 2 — CFG-parallel head-to-head against Phase 1 winner.
+#
+# Built in-tree (wan/distributed/cfg_parallel.py + edits in text2video.py /
+# image2video.py / generate.py) since xfuser has no Wan2.2 example and this
+# repo's in-house Ulysses (wan/distributed/ulysses.py) is a different stack.
+#
+# On 2× H100, the only viable concurrency cross-product is:
+#   Ulysses-2 (Phase 1 baseline)  vs.  CFG-parallel-2 (this phase)
+# A meaningful 4-way (cfg=2, uly=2) needs ≥4 GPUs (Phase 4).
+#
+# Each run ~6-7 min on A14B 832*480 → ~40-50 min wall total.
+
+defaults:
+  task: t2v-A14B
+  ckpt_dir: /workspace/Wan2.2-T2V-A14B
+  size: "832*480"
+  frame_num: 81
+  sample_steps: 40
+  prompt: "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+  base_seed: 42
+  out_root: /workspace/profile_outputs/phase2_cfg_parallel
+  runs: 3
+  skip_first: true
+
+env_defaults:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_CACHE_DIR: /workspace/.compile_cache
+  WAN_PROFILE_FLUSH_INTERVAL: "1"
+  WAN_PROFILE_GPU_SAMPLER: "1"
+
+configs:
+  # X0: Reference re-run of Phase 1's B0 (Ulysses-2) under same conditions
+  # so the comparison isn't biased by host load drift between phases.
+  - name: X0_uly2_bf16
+    nproc: 2
+    args: ["--ulysses_size", "2", "--convert_model_dtype"]
+
+  # X1: CFG-parallel-2 alone. Rank 0 runs cond, rank 1 runs uncond (full token
+  # sequences, no SP split). After both forwards, all_gather of the noise tensor
+  # on the cfg_group (across the 2 ranks) gives both ranks the cond and uncond
+  # results for the guidance merge. Both DiTs resident on each rank (~53 GB bf16).
+  - name: X1_cfg2_bf16
+    nproc: 2
+    args: ["--cfg_parallel_size", "2", "--convert_model_dtype"]
+
+  # X2: CFG-parallel-2 + compile. Composes cleanly with cfg_parallel since
+  # compile wraps the model.forward, which is invoked once per rank per step.
+  - name: X2_cfg2_bf16_compile
+    nproc: 2
+    args: ["--cfg_parallel_size", "2", "--convert_model_dtype", "--compile_model"]

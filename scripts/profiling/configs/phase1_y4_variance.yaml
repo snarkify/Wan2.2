@@ -1,0 +1,29 @@
+# Y4 variance hardening — 5 runs (skip_first → 4 measured) to harden
+# the CFG-parallel-2 claim. Yesterday's run had n=2 with one anomaly
+# (17-min stuck init on run2); this gives a clean replacement.
+#
+# Output to a fresh dir so yesterday's data isn't overwritten.
+
+defaults:
+  task: t2v-A14B
+  ckpt_dir: /workspace/Wan2.2-T2V-A14B
+  size: "1280*720"
+  frame_num: 81
+  sample_steps: 40
+  prompt: "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+  base_seed: 42
+  out_root: /workspace/profile_outputs/phase1_y4_variance
+  runs: 5
+  skip_first: true
+
+env_defaults:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_CACHE_DIR: /workspace/.compile_cache
+  WAN_PROFILE_FLUSH_INTERVAL: "1"
+  WAN_PROFILE_GPU_SAMPLER: "1"
+
+configs:
+  - name: Y4_cfg2_bf16_offload
+    nproc: 2
+    args: ["--cfg_parallel_size", "2", "--convert_model_dtype",
+           "--offload_model", "True"]

@@ -1,0 +1,50 @@
+# Single-GPU baselines + Y5 lossless-stack endpoint at 720p.
+# Fills the missing "what was the speedup measured against" reference.
+#
+# Z1: 1 GPU, 720p, offload — comparable absolute-time baseline for Y1/Y4.
+# Z2: 1 GPU, 720p, no offload — likely OOMs (54GB DiTs + 23GB activations
+#     + 11GB T5 transient ≈ 82GB > 80GB), but probes the "what if we could".
+# Z3: 1 GPU, 480p, offload — companion 480p single-GPU baseline.
+# Y5: CFG-parallel + offload + compile — completes the lossless stack.
+#
+# Time: ~2.4 hr wall (Z1 ~60 min, Z2 ~6 min if OOM, Z3 ~28 min, Y5 ~52 min).
+
+defaults:
+  task: t2v-A14B
+  ckpt_dir: /workspace/Wan2.2-T2V-A14B
+  frame_num: 81
+  sample_steps: 40
+  prompt: "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+  base_seed: 42
+  out_root: /workspace/profile_outputs/phase1_baselines
+  runs: 3
+  skip_first: true
+
+env_defaults:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_CACHE_DIR: /workspace/.compile_cache
+  WAN_PROFILE_FLUSH_INTERVAL: "1"
+  WAN_PROFILE_GPU_SAMPLER: "1"
+
+configs:
+  # Z1: 1-GPU 720p baseline. The fair comparison reference for Y1/Y4 multi-GPU.
+  - name: Z1_1gpu_720p_offload
+    nproc: 1
+    args: ["--size", "1280*720", "--convert_model_dtype", "--offload_model", "True"]
+
+  # Z2: 1-GPU 720p, both DiTs resident. Probably OOMs by ~2 GB during diffusion.
+  - name: Z2_1gpu_720p_noffload
+    nproc: 1
+    args: ["--size", "1280*720", "--convert_model_dtype"]
+
+  # Z3: 1-GPU 480p baseline. Fair reference for B0/B3.
+  - name: Z3_1gpu_480p_offload
+    nproc: 1
+    args: ["--size", "832*480", "--convert_model_dtype", "--offload_model", "True"]
+
+  # Y5: CFG-parallel-2 + offload + compile at 720p — the lossless-stack endpoint.
+  # 30 GB headroom (vs Y4) should accommodate inductor scratch.
+  - name: Y5_cfg2_bf16_offload_compile
+    nproc: 2
+    args: ["--size", "1280*720", "--cfg_parallel_size", "2", "--convert_model_dtype",
+           "--offload_model", "True", "--compile_model"]

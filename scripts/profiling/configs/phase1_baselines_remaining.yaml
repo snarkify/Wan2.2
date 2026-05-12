@@ -1,0 +1,36 @@
+# Phase 1 baselines — RESUME from yesterday's pause.
+# Z1 was already 3-run complete (diffusion 1619.9 ± 0.1s); skipping.
+# Z2 had only run0 done; redoing fresh × 3 since variance_run rm-rfs anyway.
+# Z3, Y5 were never run.
+# Total wall: ~2 hr.
+
+defaults:
+  task: t2v-A14B
+  ckpt_dir: /workspace/Wan2.2-T2V-A14B
+  frame_num: 81
+  sample_steps: 40
+  prompt: "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+  base_seed: 42
+  out_root: /workspace/profile_outputs/phase1_baselines
+  runs: 3
+  skip_first: true
+
+env_defaults:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_CACHE_DIR: /workspace/.compile_cache
+  WAN_PROFILE_FLUSH_INTERVAL: "1"
+  WAN_PROFILE_GPU_SAMPLER: "1"
+
+configs:
+  - name: Z2_1gpu_720p_noffload
+    nproc: 1
+    args: ["--size", "1280*720", "--convert_model_dtype"]
+
+  - name: Z3_1gpu_480p_offload
+    nproc: 1
+    args: ["--size", "832*480", "--convert_model_dtype", "--offload_model", "True"]
+
+  - name: Y5_cfg2_bf16_offload_compile
+    nproc: 2
+    args: ["--size", "1280*720", "--cfg_parallel_size", "2", "--convert_model_dtype",
+           "--offload_model", "True", "--compile_model"]

@@ -1,0 +1,35 @@
+# Phase 1 — RESUME (720p only, per user direction).
+# Skipping Z3 (480p baseline, dropped per scope change).
+#
+# Z2: 1-GPU 720p, no offload — completes the 1-GPU baseline picture.
+# Y5: CFG-parallel + offload + compile — completes the lossless stack.
+#
+# Total wall: ~1.7 hr (Z2 ~50 min + Y5 ~52 min, plus warmup runs).
+
+defaults:
+  task: t2v-A14B
+  ckpt_dir: /workspace/Wan2.2-T2V-A14B
+  size: "1280*720"
+  frame_num: 81
+  sample_steps: 40
+  prompt: "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+  base_seed: 42
+  out_root: /workspace/profile_outputs/phase1_baselines
+  runs: 3
+  skip_first: true
+
+env_defaults:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_CACHE_DIR: /workspace/.compile_cache
+  WAN_PROFILE_FLUSH_INTERVAL: "1"
+  WAN_PROFILE_GPU_SAMPLER: "1"
+
+configs:
+  - name: Z2_1gpu_720p_noffload
+    nproc: 1
+    args: ["--convert_model_dtype"]
+
+  - name: Y5_cfg2_bf16_offload_compile
+    nproc: 2
+    args: ["--cfg_parallel_size", "2", "--convert_model_dtype",
+           "--offload_model", "True", "--compile_model"]

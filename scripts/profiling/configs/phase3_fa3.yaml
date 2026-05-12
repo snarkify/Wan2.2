@@ -1,0 +1,33 @@
+# Phase 3 — Y4/Y5 with FA3 (Hopper-tuned attention).
+# Will only run if /workspace/venv has flash_attn_interface (FA3) installed.
+# The wan/modules/attention.py code prefers FA3 when present.
+#
+# 2 configs × 3 runs ≈ ~104 min wall.
+
+defaults:
+  task: t2v-A14B
+  ckpt_dir: /workspace/Wan2.2-T2V-A14B
+  size: "1280*720"
+  frame_num: 81
+  sample_steps: 40
+  prompt: "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+  base_seed: 42
+  out_root: /workspace/profile_outputs/phase3_fa3
+  runs: 3
+  skip_first: true
+
+env_defaults:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_CACHE_DIR: /workspace/.compile_cache
+  WAN_PROFILE_FLUSH_INTERVAL: "1"
+
+configs:
+  - name: Y4_fa3_cfg2_bf16_offload
+    nproc: 2
+    args: ["--cfg_parallel_size", "2", "--convert_model_dtype",
+           "--offload_model", "True"]
+
+  - name: Y5_fa3_cfg2_bf16_offload_compile
+    nproc: 2
+    args: ["--cfg_parallel_size", "2", "--convert_model_dtype",
+           "--offload_model", "True", "--compile_model"]

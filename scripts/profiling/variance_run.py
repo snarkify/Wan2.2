@@ -25,14 +25,23 @@ import time
 
 
 def read_run(profile_dir: str) -> dict | None:
+    """Pull aggregate metrics from a single run's timing_rank0.csv.
+
+    - peak_mb: max gpu_ms across memory/* rows (memory snapshots stash peak in gpu_ms).
+    - total_s: pipeline_init.wall_ms + pipeline_generate.wall_ms (the two macro spans
+      that bracket the entire run). Falls back to memory/pipeline_init -> pipeline_end
+      timestamp diff if span rows are missing.
+    - diffusion_s: diffusion_loop.wall_ms (the inner macro span around the for-step loop).
+    """
     csv_path = os.path.join(profile_dir, "timing_rank0.csv")
     if not os.path.exists(csv_path):
         return None
     peak = 0.0
+    init_wall_ms = None
+    gen_wall_ms = None
+    diff_wall_ms = None
     init_ts = None
     end_ts = None
-    dit_on = None
-    diff_end = None
     with open(csv_path) as f:
         next(f)  # header
         for line in f:
@@ -41,6 +50,7 @@ def read_run(profile_dir: str) -> dict | None:
                 continue
             name = parts[2]
             try:
+                wall_ms = float(parts[4])
                 gpu_ms = float(parts[5])
                 ts = float(parts[6])
             except ValueError:
@@ -48,18 +58,27 @@ def read_run(profile_dir: str) -> dict | None:
             if name.startswith("memory/") and not name.startswith("memory_frag"):
                 if gpu_ms > peak:
                     peak = gpu_ms
-            if name == "memory/init_start":
+            if name == "pipeline_init":
+                init_wall_ms = wall_ms
+            elif name == "pipeline_generate":
+                gen_wall_ms = wall_ms
+            elif name == "diffusion_loop":
+                diff_wall_ms = wall_ms
+            elif name == "memory/pipeline_init":
                 init_ts = ts
             elif name == "memory/pipeline_end":
                 end_ts = ts
-            elif name == "memory/after_dit_to_gpu":
-                dit_on = ts
-            elif name == "memory/after_diffusion_loop":
-                diff_end = ts
+    if init_wall_ms is not None and gen_wall_ms is not None:
+        total_s = (init_wall_ms + gen_wall_ms) / 1000.0
+    elif init_ts is not None and end_ts is not None:
+        total_s = end_ts - init_ts
+    else:
+        total_s = None
+    diffusion_s = diff_wall_ms / 1000.0 if diff_wall_ms is not None else None
     return {
         "peak_mb": peak,
-        "total_s": (end_ts - init_ts) if init_ts and end_ts else None,
-        "diffusion_s": (diff_end - dit_on) if dit_on and diff_end else None,
+        "total_s": total_s,
+        "diffusion_s": diffusion_s,
     }
 
 

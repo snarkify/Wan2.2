@@ -1,0 +1,31 @@
+# Phase 0 smoke test — validates sweep.py + variance_run.py + CSV plumbing
+# end-to-end on TI2V-5B before paying A14B GPU-time.
+#
+# Two configs (baseline + compile), 2 runs each, ~30s/run on H100 80GB.
+# Total wall: ~3-4 minutes including compile warmup.
+
+defaults:
+  task: ti2v-5B
+  ckpt_dir: /workspace/Wan2.2-TI2V-5B
+  size: "1280*704"
+  frame_num: 17
+  sample_steps: 10
+  prompt: "A cat walking through a sunlit meadow"
+  base_seed: 42
+  out_root: /workspace/profile_outputs/phase0_smoke_5b
+  runs: 2
+  skip_first: false
+
+env_defaults:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_CACHE_DIR: /workspace/.compile_cache
+  WAN_PROFILE_FLUSH_INTERVAL: "1"
+
+configs:
+  - name: smoke_baseline
+    nproc: 1
+    args: ["--offload_model", "True"]
+
+  - name: smoke_compile
+    nproc: 1
+    args: ["--offload_model", "True", "--compile_model"]
