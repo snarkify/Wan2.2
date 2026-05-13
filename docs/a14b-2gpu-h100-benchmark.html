@@ -121,9 +121,10 @@
     <li><a href="#i2v">Phase 3 follow-on — I2V-A14B sanity</a></li>
     <li><a href="#psnr-matrix">Cross-engine PSNR matrix &amp; visual A/B</a></li>
     <li><a href="#production">Production recommendations</a></li>
+    <li><a href="#commands">Exact launch commands for every benchmark</a></li>
     <li><a href="#insights">Key insights</a></li>
     <li><a href="#followups">Open follow-ups</a></li>
-    <li><a href="#appendix">Appendix — code changes, reproduction commands</a></li>
+    <li><a href="#appendix">Appendix — code changes, S3 archive</a></li>
   </ol>
 </nav>
 
@@ -884,8 +885,262 @@ def cfg_all_gather(tensor: torch.Tensor):
   (committed in <code>3d5df92</code>). Expected diffusion ~613 s, MD5-stable.
 </p>
 
+<!-- ==================== COMMANDS ==================== -->
+<h2 id="commands">15. Exact launch commands for every benchmark</h2>
+
+<p>
+  Every config below was launched against this fixed workload spec
+  (Wan2.2 T2V-A14B unless noted, 1280×720, 81 frames, 40 UniPC steps, seed 42,
+  the EXAMPLE_PROMPT["t2v-A14B"]["prompt"] from <code>generate.py</code>).
+  Configs are grouped by category. Replace <code>$CKPT_T2V</code> /
+  <code>$CKPT_I2V</code> / <code>$CKPT_DIFFUSERS</code> with your paths.
+</p>
+
+<h4>Shared setup</h4>
+<pre><code># In-tree (original Wan2.2 checkpoint format)
+CKPT_T2V=/workspace/Wan2.2-T2V-A14B
+CKPT_I2V=/workspace/Wan2.2-I2V-A14B
+
+# diffusers-format checkpoint (Wan-AI/Wan2.2-T2V-A14B-Diffusers)
+CKPT_DIFFUSERS=/workspace/Wan2.2-T2V-A14B-Diffusers
+
+PROMPT="Two anthropomorphic cats in comfy boxing gear and bright gloves \
+fight intensely on a spotlighted stage."
+SEED=42</code></pre>
+
+<h3>15.1 Single-GPU baselines (Z1, Z2, Diffusers-vanilla)</h3>
+
+<h4>Z1 — 1-GPU in-tree, bf16, offload (reference baseline, 1619.9 s)</h4>
+<pre><code>python generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --convert_model_dtype --offload_model True</code></pre>
+
+<h4>Z2 — 1-GPU in-tree, no offload (both DiTs resident, 1606.4 s)</h4>
+<pre><code># Same as Z1 but drop --offload_model True (needs ~64 GB free GPU mem)
+python generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --convert_model_dtype</code></pre>
+
+<h4>Diffusers-vanilla — 1-GPU vanilla <code>diffusers.WanPipeline</code> (~1065 s)</h4>
+<pre><code>python scripts/profiling/run_diffusers_vanilla.py \
+  --model $CKPT_DIFFUSERS --out ./diffusers_vanilla.mp4 \
+  --prompt "$PROMPT" --seed $SEED \
+  --height 720 --width 1280 --num_frames 81 \
+  --steps 40 --guidance_scale 4.0 --guidance_scale_2 3.0 --flow_shift 12.0</code></pre>
+
+<h3>15.2 In-tree 2× H100 matrix (Y0–Y5, all original Wan2.2 code)</h3>
+
+<h4>Y1 — Ulysses-2 (879.5 s old / 667.9 s new)</h4>
+<pre><code>torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --ulysses_size 2 --convert_model_dtype --offload_model True</code></pre>
+
+<h4>Y3 — Y1 + <code>torch.compile</code> default (875.5 s, marginal)</h4>
+<pre><code># Same as Y1, add --compile_model
+torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --ulysses_size 2 --convert_model_dtype --offload_model True \
+  --compile_model</code></pre>
+
+<h4>Y4 — CFG-parallel-2, no sync fix (original, 825.4 s)</h4>
+<pre><code># This is Y4 before the 2026-05-12 sync-fix patch — reproducible only by
+# reverting the synchronize() line in wan/distributed/cfg_parallel.py:106.
+torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --cfg_parallel_size 2 --convert_model_dtype --offload_model True</code></pre>
+
+<h4>Y4-sync ⭐ — same flags as Y4, but with the sync-fix patch applied (613.2 s)</h4>
+<pre><code># The 27% win is delivered by the patch in wan/distributed/cfg_parallel.py
+# (commit 3d5df92 in this branch). With it applied, the CLI is identical to Y4:
+torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --cfg_parallel_size 2 --convert_model_dtype --offload_model True</code></pre>
+
+<h4>Y4-no-offload — Y4-sync without <code>--offload_model True</code> (611.0 s)</h4>
+<pre><code>torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --cfg_parallel_size 2 --convert_model_dtype</code></pre>
+
+<h4>Y5 — Y4 + <code>torch.compile</code> default mode (780.6 s; 28.4 dB drift)</h4>
+<pre><code>torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --cfg_parallel_size 2 --convert_model_dtype --offload_model True \
+  --compile_model</code></pre>
+
+<h4>Y6 — Y4 + compile <code>reduce-overhead</code> (592 s; non-deterministic, ~28 dB drift)</h4>
+<pre><code># Set inductor cache + allocator hint to maximize compile-mode success rate
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TORCHINDUCTOR_CACHE_DIR=/workspace/.compile_cache
+
+torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --cfg_parallel_size 2 --convert_model_dtype --offload_model True \
+  --compile_model --compile_mode reduce-overhead</code></pre>
+
+<h4>Y7 — Y4 + compile <code>max-autotune</code> (OOM on this stack)</h4>
+<pre><code># Currently fails with CUDA OOM during inductor compilation
+# (needs ~8.65 GB scratch but CUDA Graphs private pool reserves ~10.8 GB).
+# Recorded here for completeness; not a viable config without more headroom.
+torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --cfg_parallel_size 2 --convert_model_dtype --offload_model True \
+  --compile_model --compile_mode max-autotune</code></pre>
+
+<h4>Y1-new — Ulysses-2 on new platform with SDPA fallback (667.9 s)</h4>
+<pre><code># Identical CLI to Y1. Requires the SDPA-fallback fix in
+# wan/distributed/ulysses.py + wan/modules/attention.py + wan/utils/prompt_extend.py
+# (commit 3d5df92). SDPA fallback kicks in automatically when flash-attn's
+# C++ extension fails to load due to a torch ABI mismatch.
+torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --ulysses_size 2 --convert_model_dtype --offload_model True</code></pre>
+
+<h3>15.3 Diagnostic experiments</h3>
+
+<h4>Scheduler isolation — Y4-sync with diffusers' UniPCMultistepScheduler swapped in</h4>
+<pre><code># Y4-sync runtime with WAN_USE_DIFFUSERS_SCHEDULER=1 swaps the in-tree
+# FlowUniPCMultistepScheduler for diffusers' UniPCMultistepScheduler.
+# Default behavior unchanged unless the env-var is set. Commit 1498196.
+WAN_USE_DIFFUSERS_SCHEDULER=1 \
+torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --cfg_parallel_size 2 --convert_model_dtype --offload_model True</code></pre>
+
+<h3>15.4 External engines — xDiT (xfuser)</h3>
+
+<h4>X1 — xDiT CFG-parallel-2 (763 s old / 539 s new)</h4>
+<pre><code># Requires xfuser >= 0.4.5 and our three local Wan adapter modules in
+# scripts/profiling/ (run_xdit.py, xfuser_wan_pipeline.py, xfuser_wan_transformer.py).
+torchrun --nproc_per_node=2 scripts/profiling/run_xdit.py \
+  --model $CKPT_DIFFUSERS \
+  --prompt "$PROMPT" \
+  --height 720 --width 1280 \
+  --num_frames 81 --num_inference_steps 40 \
+  --seed $SEED --guidance_scale 4.0 --guidance_scale_2 3.0 \
+  --use_cfg_parallel --ulysses_degree 1 --ring_degree 1 \
+  --profile_dir ./xdit_X1_out --output_path ./xdit_X1_out/output.mp4</code></pre>
+
+<h4>X2 — xDiT USP-2 (Ulysses inside xfuser) — OOM</h4>
+<pre><code># Same as X1 but with ulysses_degree=2 instead of cfg_parallel.
+# Fails because xfuser's SP wrapper allocates full-sequence scratch
+# and doesn't compose with diffusers' --cpu-offload.
+torchrun --nproc_per_node=2 scripts/profiling/run_xdit.py \
+  --model $CKPT_DIFFUSERS \
+  --prompt "$PROMPT" \
+  --height 720 --width 1280 \
+  --num_frames 81 --num_inference_steps 40 \
+  --seed $SEED --guidance_scale 4.0 --guidance_scale_2 3.0 \
+  --ulysses_degree 2 --ring_degree 1 \
+  --profile_dir ./xdit_X2_out</code></pre>
+
+<h3>15.5 External engines — SGLang-Diffusion</h3>
+
+<p>
+  SGLang uses a server + request pattern: launch a long-running server
+  with the parallelism configuration, then issue generation requests to it
+  via HTTP / Python client. Below are the <code>server_args</code> for each
+  S1/S2/S3 config, captured verbatim from the server's startup log.
+</p>
+
+<h4>S1 ⭐ — SGLang CFG-parallel-2 (393.1 s)</h4>
+<pre><code># Server launch (sglang-diffusion v0.5.11)
+python -m sglang_diffusion.serve_engine \
+  --model-path $CKPT_DIFFUSERS \
+  --num-gpus 2 \
+  --enable-cfg-parallel \
+  --dit-cpu-offload --dit-layerwise-offload true \
+  --text-encoder-cpu-offload --image-encoder-cpu-offload \
+  --vae-cpu-offload --pin-cpu-memory
+
+# Then issue the generation request via the SGLang client at 1280x720, 81
+# frames, 40 steps, seed 42 with the canonical EXAMPLE_PROMPT.</code></pre>
+
+<h4>S2 — SGLang Ulysses-2 (420.2 s)</h4>
+<pre><code># Same as S1 but swap --enable-cfg-parallel for --ulysses-degree 2:
+python -m sglang_diffusion.serve_engine \
+  --model-path $CKPT_DIFFUSERS \
+  --num-gpus 2 \
+  --ulysses-degree 2 \
+  --dit-cpu-offload --dit-layerwise-offload true \
+  --text-encoder-cpu-offload --image-encoder-cpu-offload \
+  --vae-cpu-offload --pin-cpu-memory</code></pre>
+
+<h4>S3 — SGLang TP-2 (448.4 s)</h4>
+<pre><code># Tensor-parallel within the DiT
+python -m sglang_diffusion.serve_engine \
+  --model-path $CKPT_DIFFUSERS \
+  --num-gpus 2 \
+  --tp-size 2 \
+  --dit-cpu-offload --dit-layerwise-offload true \
+  --text-encoder-cpu-offload --image-encoder-cpu-offload \
+  --vae-cpu-offload --pin-cpu-memory</code></pre>
+
+<p class="footnote">
+  Note: <code>scripts/profiling/run_sglang_bench.sh</code> wrapped the above
+  loops + per-request timing parsing but lived only on the benchmark server
+  and wasn't committed to the repo. The <code>server_args</code> shown are
+  captured from the actual run logs at
+  <code>profile_outputs/post_may11_logs.tar.gz</code> in the S3 archive.
+</p>
+
+<h3>15.6 I2V sanity</h3>
+
+<h4>I2V-Y4-sync — I2V-A14B on Y4-sync config (617.4 s)</h4>
+<pre><code># I2V uses the same Y4-sync flags but task=i2v-A14B with the I2V checkpoint
+# and an input image (canonical example image bundled with the repo).
+I2V_PROMPT="Summer beach vacation style, a white cat wearing sunglasses sits \
+on a surfboard. The fluffy-furred feline gazes directly at the camera with a \
+relaxed expression..."
+
+torchrun --nproc_per_node=2 generate.py --task i2v-A14B --ckpt_dir $CKPT_I2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$I2V_PROMPT" \
+  --image examples/i2v_input.JPG \
+  --cfg_parallel_size 2 --convert_model_dtype --offload_model True</code></pre>
+
+<h3>15.7 Sweep-harness equivalents</h3>
+
+<p>
+  The full per-phase sweeps were driven by <code>scripts/profiling/sweep.py</code>
+  reading YAML from <code>scripts/profiling/configs/</code>. Examples:
+</p>
+
+<pre><code># Phase 1 — 720p in-tree matrix (Y0..Y5)
+python scripts/profiling/sweep.py scripts/profiling/configs/phase1_720p.yaml
+
+# Y4 variance hardening (n=5)
+python scripts/profiling/sweep.py scripts/profiling/configs/phase1_y4_variance.yaml
+
+# Y5 variance hardening
+python scripts/profiling/sweep.py scripts/profiling/configs/phase3_y5_variance.yaml
+
+# Phase 3 compile-mode tuning (Y6, Y7)
+python scripts/profiling/sweep.py scripts/profiling/configs/phase3_compile_modes.yaml</code></pre>
+
+<p class="footnote">
+  Each YAML pins <code>task</code>, <code>ckpt_dir</code>, <code>size</code>,
+  <code>frame_num</code>, <code>sample_steps</code>, <code>prompt</code>,
+  <code>base_seed</code>, plus a list of named configs (each with its own
+  <code>nproc</code>, <code>args</code>, optional <code>env</code>). The harness
+  shells out to <code>variance_run.py</code> with <code>--skip-first --runs N</code>,
+  records per-rank timing CSVs + Chrome traces, and emits
+  <code>sweep_results.csv</code> + a markdown comparison table on stdout.
+</p>
+
 <!-- ==================== INSIGHTS ==================== -->
-<h2 id="insights">15. Key insights</h2>
+<h2 id="insights">16. Key insights</h2>
 
 <ol>
   <li>
@@ -943,7 +1198,7 @@ def cfg_all_gather(tensor: torch.Tensor):
 </ol>
 
 <!-- ==================== FOLLOWUPS ==================== -->
-<h2 id="followups">16. Open follow-ups</h2>
+<h2 id="followups">17. Open follow-ups</h2>
 
 <table>
   <thead><tr>
@@ -960,7 +1215,7 @@ def cfg_all_gather(tensor: torch.Tensor):
 </table>
 
 <!-- ==================== APPENDIX ==================== -->
-<h2 id="appendix">17. Appendix — code changes &amp; reproduction</h2>
+<h2 id="appendix">18. Appendix — code changes &amp; S3 archive</h2>
 
 <h3>Git commits on <code>multi-gpu</code> from this engagement</h3>
 <pre><code>1498196  Add WAN_USE_DIFFUSERS_SCHEDULER diagnostic flag

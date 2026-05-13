@@ -225,15 +225,133 @@ For **single-GPU** deployment (cost-optimized, latency-tolerant): Z1 at 1620 s d
 
 The full sweep harness, configs, and analyzer scripts live in `scripts/profiling/`. The CFG-parallel implementation is in `wan/distributed/cfg_parallel.py`; pipeline integration is in `wan/text2video.py` (lines 22–26 imports, 359–378 dispatch) and `wan/image2video.py`. The `--cfg_parallel_size N` flag is added in `generate.py:151–157`.
 
-To reproduce Y4:
+The full per-benchmark launch commands are in the HTML companion at [`a14b-2gpu-h100-benchmark.html`, section 15](a14b-2gpu-h100-benchmark.html#commands). A condensed subset is reproduced below.
+
+### Shared setup
 
 ```bash
-torchrun --nproc_per_node=2 generate.py \
-  --task t2v-A14B --ckpt_dir <path> \
-  --size '1280*720' --frame_num 81 --sample_steps 40 \
-  --base_seed 42 --prompt '<...>' \
-  --cfg_parallel_size 2 --convert_model_dtype --offload_model True \
-  --profile_dir ./out
+CKPT_T2V=/workspace/Wan2.2-T2V-A14B
+CKPT_I2V=/workspace/Wan2.2-I2V-A14B
+CKPT_DIFFUSERS=/workspace/Wan2.2-T2V-A14B-Diffusers
+
+PROMPT="Two anthropomorphic cats in comfy boxing gear and bright gloves \
+fight intensely on a spotlighted stage."
+SEED=42
 ```
 
-Expected: ~825 s diffusion, peak ~61 GB per rank, output mp4 byte-identical to the same command with `--ulysses_size 2` instead of `--cfg_parallel_size 2`.
+### Y4-sync ⭐ (in-tree winner, 613.2 s, MD5-stable)
+
+```bash
+torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --cfg_parallel_size 2 --convert_model_dtype --offload_model True
+```
+
+The 27% sync-fix win is delivered by the patch in `wan/distributed/cfg_parallel.py:106` (commit `3d5df92` on `multi-gpu`). With the patch applied, no CLI change vs the original Y4.
+
+### Z1 — 1-GPU baseline (1619.9 s)
+
+```bash
+python generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --convert_model_dtype --offload_model True
+```
+
+### Y1 — Ulysses-2 (879.5 s old / 667.9 s new platform)
+
+```bash
+torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --ulysses_size 2 --convert_model_dtype --offload_model True
+```
+
+### Y5 / Y6 / Y7 — torch.compile variants
+
+```bash
+# Y5 — default compile mode (780.6 s, 28.4 dB drift)
+torchrun --nproc_per_node=2 generate.py ... --cfg_parallel_size 2 \
+  --convert_model_dtype --offload_model True --compile_model
+
+# Y6 — reduce-overhead (~592 s, non-deterministic, ~28 dB drift)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+torchrun --nproc_per_node=2 generate.py ... --cfg_parallel_size 2 \
+  --convert_model_dtype --offload_model True \
+  --compile_model --compile_mode reduce-overhead
+
+# Y7 — max-autotune (OOMs on this stack at compile time)
+torchrun --nproc_per_node=2 generate.py ... --compile_model --compile_mode max-autotune
+```
+
+### I2V-Y4-sync — I2V-A14B on Y4-sync (617.4 s)
+
+```bash
+torchrun --nproc_per_node=2 generate.py --task i2v-A14B --ckpt_dir $CKPT_I2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$I2V_PROMPT" \
+  --image examples/i2v_input.JPG \
+  --cfg_parallel_size 2 --convert_model_dtype --offload_model True
+```
+
+### Diagnostic — Y4-sync with diffusers' scheduler
+
+```bash
+WAN_USE_DIFFUSERS_SCHEDULER=1 \
+torchrun --nproc_per_node=2 generate.py --task t2v-A14B --ckpt_dir $CKPT_T2V \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed $SEED --prompt "$PROMPT" \
+  --cfg_parallel_size 2 --convert_model_dtype --offload_model True
+```
+
+### X1 — xDiT (xfuser) CFG-parallel-2 (763 s old / 539 s new)
+
+```bash
+torchrun --nproc_per_node=2 scripts/profiling/run_xdit.py \
+  --model $CKPT_DIFFUSERS \
+  --prompt "$PROMPT" --height 720 --width 1280 \
+  --num_frames 81 --num_inference_steps 40 \
+  --seed $SEED --guidance_scale 4.0 --guidance_scale_2 3.0 \
+  --use_cfg_parallel --ulysses_degree 1 --ring_degree 1 \
+  --profile_dir ./xdit_out --output_path ./xdit_out/output.mp4
+```
+
+### Vanilla diffusers WanPipeline (1-GPU, ~1065 s)
+
+```bash
+python scripts/profiling/run_diffusers_vanilla.py \
+  --model $CKPT_DIFFUSERS --out ./diffusers_vanilla.mp4 \
+  --prompt "$PROMPT" --seed $SEED \
+  --height 720 --width 1280 --num_frames 81 \
+  --steps 40 --guidance_scale 4.0 --guidance_scale_2 3.0 --flow_shift 12.0
+```
+
+### SGLang S1 ⭐ — CFG-parallel-2 (393.1 s)
+
+SGLang uses a long-running server + per-request generation. Server launch:
+
+```bash
+python -m sglang_diffusion.serve_engine \
+  --model-path $CKPT_DIFFUSERS \
+  --num-gpus 2 \
+  --enable-cfg-parallel \
+  --dit-cpu-offload --dit-layerwise-offload true \
+  --text-encoder-cpu-offload --image-encoder-cpu-offload \
+  --vae-cpu-offload --pin-cpu-memory
+```
+
+For **S2 (Ulysses-2)** swap `--enable-cfg-parallel` for `--ulysses-degree 2`. For **S3 (TP-2)** swap for `--tp-size 2`. Then issue the generation request at 1280×720, 81 frames, 40 steps, seed 42 via the SGLang client.
+
+### Sweep-harness equivalents
+
+```bash
+# Phase 1 — 720p in-tree matrix (Y0..Y5)
+python scripts/profiling/sweep.py scripts/profiling/configs/phase1_720p.yaml
+# Y4 variance hardening (n=5)
+python scripts/profiling/sweep.py scripts/profiling/configs/phase1_y4_variance.yaml
+# Phase 3 compile-mode tuning (Y6, Y7)
+python scripts/profiling/sweep.py scripts/profiling/configs/phase3_compile_modes.yaml
+```
+
+Each YAML pins the workload (`task`, `ckpt_dir`, `size`, `frame_num`, `sample_steps`, `prompt`, `base_seed`) and lists named configs (each with its own `nproc`, `args`, optional `env`). The harness shells out to `variance_run.py` with `--skip-first --runs N`, records per-rank timing CSVs + Chrome traces, and emits `sweep_results.csv` plus a markdown comparison table.
