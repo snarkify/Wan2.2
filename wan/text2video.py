@@ -6,7 +6,7 @@ import os
 import random
 import sys
 import types
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 
 import torch
@@ -32,6 +32,35 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+
+def _maybe_kernel_profiler():
+    """Return a torch.profiler.profile() context if WAN_PROFILE_KERNELS=1,
+    otherwise None. Used for Track-A per-kernel decomposition of the DiT
+    forward (attention vs matmul vs layernorm vs ...).
+
+    Schedule: skip the first 2 diffusion steps (compile/warmup noise),
+    warmup the profiler on step 2, capture kernel events for steps 3-4.
+    The diffusion loop early-exits at step 5 in this mode so the run
+    finishes quickly — Track-A doesn't need the full mp4, just the
+    kernel-level trace.
+
+    Trace files (Chrome / Perfetto format) land in $WAN_PROFILE_KERNELS_DIR
+    (default ./kernel_profile/).
+    """
+    if os.environ.get('WAN_PROFILE_KERNELS') != '1':
+        return None
+    import torch.profiler as p
+    out_dir = os.environ.get('WAN_PROFILE_KERNELS_DIR', './kernel_profile')
+    os.makedirs(out_dir, exist_ok=True)
+    return p.profile(
+        activities=[p.ProfilerActivity.CPU, p.ProfilerActivity.CUDA],
+        schedule=p.schedule(wait=2, warmup=1, active=2, repeat=1),
+        on_trace_ready=p.tensorboard_trace_handler(out_dir),
+        record_shapes=True,
+        with_stack=False,
+        profile_memory=False,
+    )
 
 # Diagnostic scheduler swap: import diffusers' UniPCMultistepScheduler lazily
 # only when needed, so that the import doesn't add to default startup. We
@@ -378,7 +407,9 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            with profiled_loop() as loop:
+            _kprof = _maybe_kernel_profiler()
+            _kprof_ctx = _kprof if _kprof is not None else nullcontext()
+            with profiled_loop() as loop, _kprof_ctx:
               for step_idx, t in enumerate(tqdm(timesteps)):
                 with loop.step(step_idx) as spans:
                     latent_model_input = latents
@@ -429,6 +460,16 @@ class WanT2V:
                             latents[0].unsqueeze(0),
                             **step_kwargs)[0]
                     latents = [temp_x0.squeeze(0)]
+
+                # Kernel-profiler step boundary + early-exit. Only fires when
+                # WAN_PROFILE_KERNELS=1; otherwise this block is a no-op and
+                # the loop runs through all 40 steps as usual.
+                if _kprof is not None:
+                    _kprof.step()
+                    if step_idx >= 4:
+                        # schedule(wait=2, warmup=1, active=2) captured
+                        # steps 3-4 (0-indexed). Anything after is wasted.
+                        break
 
             x0 = latents
             if offload_model:
