@@ -32,12 +32,15 @@ CATEGORIES = [
     # name              priority  patterns (case-insensitive substring or regex)
     ("attention_math",  [
         r"flash[_-]?attn",
+        r"flash_fprop",                      # cuDNN flash-style attention forward
         r"scaled_dot_product",
+        r"native_sdpa",                      # cuDNN sm90 SDPA kernels
         r"_efficient_attention",
         r"_attention_forward",
+        r"cudnn_generated.*sdpa",
         r"FlashFwd",
         r"fmha",
-        r"softmax",          # part of attention
+        r"softmax",                          # part of attention path
     ]),
     ("matmul",          [
         r"\baten::mm\b",
@@ -46,10 +49,13 @@ CATEGORIES = [
         r"\baten::baddbmm\b",
         r"\baten::matmul\b",
         r"\baten::linear\b",
+        r"\bnvjet",                          # NVIDIA's modern GEMM (sm90+)
+        r"xmma_gemm",                        # cuBLAS xmma
         r"gemm",
         r"cublas",
         r"cutlass",
         r"\bmma_kernel\b",
+        r"WGMMA",                            # Hopper warp-group MMA (raw)
     ]),
     ("layernorm",       [
         r"layer_norm",
@@ -68,7 +74,11 @@ CATEGORIES = [
         r"\baten::mul\b", r"\baten::mul_\b",
         r"\baten::div\b", r"\baten::sub\b",
         r"\baten::neg\b",
+        # PyTorch elementwise GPU kernel templates (the actual CUDA kernel
+        # names that show up under cat="kernel"):
+        r"elementwise_kernel",
         r"vectorized_elementwise",
+        r"unrolled_elementwise",
         r"cudaLaunchKernel",
     ]),
     ("reshape_view",    [
@@ -202,6 +212,22 @@ def main():
         d = m - p
         sign = "+" if d >= 0 else ""
         print(f"{cat:<20} {p:>12.1f} % {m:>12.1f} % {sign}{d:>8.1f}")
+
+    print()
+    # Show the top kernels still landing in "other" so we can refine the
+    # category regex on iteration.
+    print()
+    other_kernels = [
+        (name, us) for name, us in kernel_us.items() if categorize(name) == "other"
+    ]
+    other_kernels.sort(key=lambda kv: -kv[1])
+    if other_kernels:
+        print(f"=== Top kernels still in 'other' (refine the regex if any are large) ===")
+        for name, us in other_kernels[:10]:
+            ms = us / 1000.0
+            pct = 100.0 * us / total_us if total_us else 0
+            disp = name if len(name) <= 68 else name[:65] + "..."
+            print(f"  {disp:<70} {ms:>8.1f} ms  {pct:>5.2f}%")
 
     print()
     print("Interpretation:")

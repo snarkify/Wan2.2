@@ -34,33 +34,58 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
-def _maybe_kernel_profiler():
-    """Return a torch.profiler.profile() context if WAN_PROFILE_KERNELS=1,
-    otherwise None. Used for Track-A per-kernel decomposition of the DiT
-    forward (attention vs matmul vs layernorm vs ...).
+_KERNEL_PROFILE_TARGETS = {
+    # name        (wait, warmup, active, repeat, early_exit_step)
+    'steady':     (2,    1,      2,      1,      5),    # steps 3-4 (default)
+    'warmup':     (0,    0,      1,      1,      1),    # step 0 only
+    'boundary':   (24,   1,      2,      1,      27),   # steps 25-26 (the high-noise → low-noise swap)
+}
 
-    Schedule: skip the first 2 diffusion steps (compile/warmup noise),
-    warmup the profiler on step 2, capture kernel events for steps 3-4.
-    The diffusion loop early-exits at step 5 in this mode so the run
-    finishes quickly — Track-A doesn't need the full mp4, just the
-    kernel-level trace.
+
+def _maybe_kernel_profiler():
+    """Return (torch.profiler.profile() context, early_exit_step) when
+    WAN_PROFILE_KERNELS=1, otherwise (None, -1).
+
+    Track-A per-kernel decomposition of the DiT forward. Target selects
+    which diffusion step(s) get profiled, controlled by
+    WAN_PROFILE_KERNELS_TARGET (default 'steady'):
+
+        steady    — captures 2 steady-state high-noise steps (steps 3-4).
+                    Best representative of per-step cost across the loop.
+        warmup    — captures step 0 only (first iteration; compile + JIT +
+                    allocator initial state). Explains why step 0 takes
+                    ~23 s vs ~14 s steady.
+        boundary  — captures steps 25-26, the high-noise → low-noise model
+                    swap. Explains why step 26 takes ~41 s vs ~14 s steady.
+
+    Diffusion loop early-exits after capturing, so each run is cheap
+    (~5 min generation + model load). Default behavior is unchanged when
+    the env-var is unset.
 
     Trace files (Chrome / Perfetto format) land in $WAN_PROFILE_KERNELS_DIR
     (default ./kernel_profile/).
     """
     if os.environ.get('WAN_PROFILE_KERNELS') != '1':
-        return None
+        return None, -1
     import torch.profiler as p
+    target = os.environ.get('WAN_PROFILE_KERNELS_TARGET', 'steady')
+    if target not in _KERNEL_PROFILE_TARGETS:
+        raise ValueError(
+            f"WAN_PROFILE_KERNELS_TARGET={target!r} must be one of "
+            f"{list(_KERNEL_PROFILE_TARGETS)}")
+    wait_, warmup_, active_, repeat_, early_exit = _KERNEL_PROFILE_TARGETS[target]
     out_dir = os.environ.get('WAN_PROFILE_KERNELS_DIR', './kernel_profile')
     os.makedirs(out_dir, exist_ok=True)
-    return p.profile(
+    prof = p.profile(
         activities=[p.ProfilerActivity.CPU, p.ProfilerActivity.CUDA],
-        schedule=p.schedule(wait=2, warmup=1, active=2, repeat=1),
+        schedule=p.schedule(
+            wait=wait_, warmup=warmup_, active=active_, repeat=repeat_),
         on_trace_ready=p.tensorboard_trace_handler(out_dir),
         record_shapes=True,
         with_stack=False,
         profile_memory=False,
     )
+    return prof, early_exit
 
 # Diagnostic scheduler swap: import diffusers' UniPCMultistepScheduler lazily
 # only when needed, so that the import doesn't add to default startup. We
@@ -407,7 +432,7 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            _kprof = _maybe_kernel_profiler()
+            _kprof, _kprof_exit = _maybe_kernel_profiler()
             _kprof_ctx = _kprof if _kprof is not None else nullcontext()
             with profiled_loop() as loop, _kprof_ctx:
               for step_idx, t in enumerate(tqdm(timesteps)):
@@ -466,9 +491,9 @@ class WanT2V:
                 # the loop runs through all 40 steps as usual.
                 if _kprof is not None:
                     _kprof.step()
-                    if step_idx >= 4:
-                        # schedule(wait=2, warmup=1, active=2) captured
-                        # steps 3-4 (0-indexed). Anything after is wasted.
+                    if step_idx >= _kprof_exit:
+                        # Captured everything we needed for this target;
+                        # anything after is wasted compute.
                         break
 
             x0 = latents

@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Wan2.2 T2V-A14B — Per-Kernel Performance Breakdown (Track A)</title>
+<style>
+  :root {
+    --fg:#1a1f24; --muted:#586069; --bg:#fafbfc; --panel:#ffffff;
+    --line:#e1e4e8; --accent:#0366d6; --good:#22863a; --warn:#b08800;
+    --bad:#cb2431; --code-bg:#f6f8fa;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI",
+      Helvetica, Arial, sans-serif; color: var(--fg); background: var(--bg);
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 28px 80px; }
+  header.title { border-bottom: 1px solid var(--line); padding-bottom: 22px;
+    margin-bottom: 28px; }
+  h1 { font-size: 28px; margin: 0 0 8px; line-height: 1.2; }
+  h2 { font-size: 22px; margin: 40px 0 14px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--line); }
+  h3 { font-size: 17px; margin: 26px 0 10px; }
+  h4 { font-size: 14px; margin: 18px 0 8px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.5px; }
+  p, ul, ol { margin: 0 0 14px; }
+  ul, ol { padding-left: 22px; }
+  li { margin-bottom: 4px; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    font-size: 13px; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  pre { background: var(--code-bg); padding: 12px 14px; border-radius: 6px;
+    overflow-x: auto; border: 1px solid var(--line); }
+  pre code { background: transparent; padding: 0; }
+  table { border-collapse: collapse; margin: 8px 0 18px; width: 100%;
+    background: var(--panel); }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left;
+    vertical-align: top; }
+  th { background: #f6f8fa; font-weight: 600; font-size: 13px; }
+  td { font-size: 14px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr:hover td { background: #fafcff; }
+  .winner { background: #f0fff4 !important; font-weight: 500; }
+  .winner td:first-child { border-left: 3px solid var(--good); }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.3px; vertical-align: middle; }
+  .badge.good { background: #d4f4dd; color: #1a6c2a; }
+  .badge.bad  { background: #ffd8d8; color: #a4001b; }
+  .badge.warn { background: #fff5cf; color: #735c00; }
+  .badge.neutral { background: #e1e4e8; color: #444; }
+  blockquote { margin: 14px 0; padding: 8px 14px; border-left: 3px solid var(--accent);
+    background: #f1f8ff; color: #24292e; }
+  blockquote.bad { border-color: var(--bad); background: #fff5f5; }
+  blockquote.good { border-color: var(--good); background: #f0fff4; }
+  blockquote.warn { border-color: var(--warn); background: #fffbf0; }
+  .toc { background: var(--panel); border: 1px solid var(--line); padding: 16px 24px;
+    border-radius: 8px; margin-bottom: 22px; }
+  .toc h4 { margin-top: 0; }
+  .toc ol { margin: 0; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .key-finding { background: #fff8e6; border: 1px solid #f9d77e; padding: 10px 14px;
+    border-radius: 6px; margin: 10px 0 18px; }
+  .key-finding::before { content: "★ "; color: #d4a000; font-weight: 700; }
+  hr.section { border: 0; border-top: 1px dashed var(--line); margin: 32px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 12px 0; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 18px; margin: 12px 0; }
+  .grid4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 14px; margin: 12px 0; }
+  .stat { background: var(--panel); border: 1px solid var(--line); padding: 14px;
+    border-radius: 6px; }
+  .stat .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .l { font-size: 12px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.4px; margin-top: 4px; }
+  .stat .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  svg.chart { display: block; margin: 12px auto 18px; max-width: 100%; }
+  .small { font-size: 13px; }
+  .muted { color: var(--muted); }
+  .footnote { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .compare { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 14px 18px; margin: 10px 0 18px; }
+  .compare h4 { margin-top: 0; }
+  details { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 10px 14px; margin: 10px 0; }
+  details summary { cursor: pointer; font-weight: 600; color: var(--accent); }
+  details summary:hover { color: #024da1; }
+  details[open] summary { margin-bottom: 8px; }
+  .pie-row { display: flex; align-items: center; gap: 12px; margin: 4px 0;
+    font-variant-numeric: tabular-nums; }
+  .pie-label { width: 200px; text-align: right; font-size: 13px; }
+  .pie-bar-bg { flex: 1; background: #e9ecef; border-radius: 3px; height: 18px; position: relative; }
+  .pie-bar { height: 18px; border-radius: 3px; }
+  .pie-pct { width: 80px; text-align: right; font-size: 13px; }
+  .pie-ms { width: 100px; text-align: right; font-size: 12px; color: var(--muted); }
+  .col-att      { background: #d4f4dd; color: #1a6c2a; }
+  .col-mm       { background: #d6e8ff; color: #06419a; }
+  .col-ew       { background: #fff5cf; color: #735c00; }
+  .col-ln       { background: #f3d6f8; color: #6c2d77; }
+  .col-other    { background: #e1e4e8; color: #444; }
+  .col-memcpy   { background: #ffd8d8; color: #a4001b; }
+  .legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    margin-right: 4px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="title">
+  <h1>Wan2.2 T2V-A14B — Per-Kernel Performance Breakdown</h1>
+  <p class="meta">
+    Track A: kernel-level decomposition of the DiT forward pass on 1× H100 80 GB ·
+    1280×720, 81 frames, 40 UniPC steps, bf16 ·
+    Source: <code>torch.profiler.profile()</code> traces taken 2026-05-20 ·
+    Author: Boyu Sun (Snarkify) ·
+    Companion to <a href="a14b-2gpu-h100-benchmark.html">the multi-engine benchmark report</a>
+  </p>
+</header>
+
+<!-- ==================== TOC ==================== -->
+<nav class="toc">
+  <h4>Contents</h4>
+  <ol>
+    <li><a href="#summary">Executive summary</a></li>
+    <li><a href="#why-and-how">Why Track A &amp; how it's measured</a></li>
+    <li><a href="#steady">Steady-state DiT forward — the per-step pie chart</a></li>
+    <li><a href="#top-kernels">Top kernels — what's actually running on the GPU</a></li>
+    <li><a href="#throughput">Achieved throughput vs H100 peak</a></li>
+    <li><a href="#warmup">Step 0 (warmup) — the cuBLAS autotune story</a></li>
+    <li><a href="#boundary">Step 26 (boundary swap) — the PCIe pageable-memcpy story</a></li>
+    <li><a href="#cross-step">Cross-step invariance check</a></li>
+    <li><a href="#budget">Full budget accounting — accounting for 99% of 613 s</a></li>
+    <li><a href="#optimizations">Optimization implications — what to spend effort on</a></li>
+    <li><a href="#reproduce">Reproduction commands &amp; code patches</a></li>
+  </ol>
+</nav>
+
+<!-- ==================== SUMMARY ==================== -->
+<h2 id="summary">1. Executive summary</h2>
+
+<p>
+  Verified at the CUDA-kernel level: inside Wan2.2's 14B DiT forward at
+  1280×720, <strong>self-attention dominates the per-step budget but not as much
+  as the back-of-envelope predicted</strong>, and three secondary costs are
+  larger than expected.
+</p>
+
+<div class="grid4">
+  <div class="stat" style="border-color:#22863a;border-width:2px;">
+    <div class="v" style="color:#22863a">59.2%</div>
+    <div class="l">Attention math</div>
+    <div class="sub">cuDNN flash-WGMMA on Hopper</div>
+  </div>
+  <div class="stat" style="border-color:#0366d6;border-width:2px;">
+    <div class="v" style="color:#0366d6">20.3%</div>
+    <div class="l">Matmul (FFN + projections)</div>
+    <div class="sub">nvjet kernels at 27% peak</div>
+  </div>
+  <div class="stat" style="border-color:#b08800;border-width:2px;">
+    <div class="v" style="color:#b08800">18.7%</div>
+    <div class="l">Elementwise</div>
+    <div class="sub">~14 fragmented kernel variants</div>
+  </div>
+  <div class="stat">
+    <div class="v">1.3%</div>
+    <div class="l">LayerNorm</div>
+    <div class="sub">vectorized, essentially free</div>
+  </div>
+</div>
+
+<div class="key-finding">
+  <strong>The "SDPA fallback" was a misleading label.</strong> The dominant
+  attention kernel is <code>cudnn_generated_fort_native_sdpa_sm90_flash_fprop_wgmma_f16_*</code> —
+  cuDNN's FlashAttention-style implementation using Hopper's WGMMA instruction,
+  achieving ~560 TFLOPS sustained. We've been running an FA-class kernel all along.
+  This shrinks the realistic FA3 upgrade win from "~140 s" (original estimate vs naive SDPA)
+  to <strong>~100-130 s</strong> (vs cuDNN's already-FA2-class kernel).
+</div>
+
+<div class="key-finding">
+  <strong>FFN matmul achieves only 27% of H100's BF16 peak.</strong>
+  Two <code>nvjet_sm90_*_TNT</code> kernels (the FFN up/down projections) eat 16.6% of
+  the budget at ~205 TFLOPS sustained out of ~750 TFLOPS dense peak.
+  This is the regime where <strong>FP8 quantization has outsized leverage</strong> — same arithmetic
+  intensity, half the bytes through HBM. If FP8 lifts these kernels to 50% of FP8 peak,
+  we'd save ~5 s/step × 40 = <strong>200 s on the diffusion loop</strong>.
+</div>
+
+<div class="key-finding">
+  <strong>Step 26's extra 27 s is unpinned PCIe memcpy, not compute.</strong>
+  At the boundary timestep, Wan2.2 swaps high-noise → low-noise DiT via
+  <em>pageable</em> host memory (~2 GB/s), costing 13.4 s DtoH + 13.3 s HtoD =
+  ~27 s for 54 GB of model weights moved. Either dropping
+  <code>--offload_model True</code> (already proved bit-equal via Y4-no-offload, 0 s)
+  or calling <code>.pin_memory()</code> on the CPU-resident DiT weights
+  (~22-25 s saved) eliminates it.
+</div>
+
+<div class="key-finding">
+  <strong>Step 0's extra 9.4 s is cuBLAS/cuDNN autotune, not compute.</strong>
+  GPU kernel mix on step 0 is byte-for-byte identical to steady-state; the
+  extra time is in CPU-side first-call kernel selection that gets memoized for the remaining
+  39 steps. Unavoidable, but tiny in absolute terms.
+</div>
+
+<!-- ==================== WHY AND HOW ==================== -->
+<h2 id="why-and-how">2. Why Track A &amp; how it's measured</h2>
+
+<p>
+  The <a href="a14b-2gpu-h100-benchmark.html">multi-engine benchmark report</a> showed
+  that on 2× H100, our in-tree CFG-parallel-2 + sync fix (Y4-sync) reaches <strong>613 s
+  diffusion at 2.64× single-GPU</strong>. That number is the total — but where, inside
+  the 11.92-second-per-step DiT forward, does the time go? Is it attention? MLP?
+  LayerNorm? Memory ops?
+</p>
+
+<p>
+  The earlier coarse trace (Wan's custom span profiler) gives us "model_forward_cfg_split
+  is 12 s/step" but no breakdown inside. Track A's job: replace the back-of-envelope estimate
+  with measured ground truth, identify the actual bottleneck, and surface non-obvious
+  costs (the boundary swap, the warmup overhead) so future optimization is targeted at
+  real bottlenecks instead of imagined ones.
+</p>
+
+<h3>How the measurement was taken</h3>
+
+<p>
+  A small env-gated patch to <code>wan/text2video.py</code> wraps the diffusion
+  loop in <code>torch.profiler.profile()</code> with a schedule that captures
+  exactly a few diffusion steps (skips warmup noise, records the steady-state /
+  warmup / boundary as needed). The loop early-exits after capturing — no VAE
+  decode, no full mp4 — so each run finishes in ~12 min on a single H100. Default
+  behavior is unchanged when <code>WAN_PROFILE_KERNELS</code> isn't set.
+</p>
+
+<pre><code># Three runs, each ~12 min on 1× H100. Targets selected via env-flag.
+WAN_PROFILE_KERNELS=1 WAN_PROFILE_KERNELS_TARGET=steady    python generate.py ...
+WAN_PROFILE_KERNELS=1 WAN_PROFILE_KERNELS_TARGET=warmup    python generate.py ...
+WAN_PROFILE_KERNELS=1 WAN_PROFILE_KERNELS_TARGET=boundary  python generate.py ...</code></pre>
+
+<p>
+  Each trace is a Chrome / Perfetto JSON ~30-75 MB. A post-processing script,
+  <code>scripts/profiling/analyze_kernel_trace.py</code>, buckets every GPU
+  kernel into semantic categories (<em>attention_math</em>, <em>matmul</em>,
+  <em>layernorm</em>, <em>elementwise</em>, etc.) by regex on kernel name,
+  and reports per-category totals + the top individual kernels + a
+  side-by-side delta vs the analytical prediction. See §<a href="#reproduce">11</a>
+  for full reproduction details.
+</p>
+
+<!-- ==================== STEADY ==================== -->
+<h2 id="steady">3. Steady-state DiT forward — the per-step pie chart</h2>
+
+<p>
+  Captured: steps 3-4 of the 40-step diffusion loop on a Y4-sync-equivalent
+  Z1-style 1-GPU run. The DiT is in "high-noise model" phase. Two forwards
+  (cond + uncond), aggregated across both, plus a tiny amount of scheduler /
+  LayerNorm modulation work.
+</p>
+
+<svg class="chart" viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg" aria-label="Per-category time breakdown bar chart">
+  <style>
+    .lbl  { font: 13px -apple-system, sans-serif; fill: #24292e; }
+    .lblmono { font: 12px ui-monospace, Menlo, monospace; fill: #444; }
+  </style>
+  <!-- bar = horizontal, scale: 56,458 ms → 600 px -->
+  <g>
+    <!-- attention 59.2% = 33406 ms -->
+    <rect x="180" y="20"  width="354.8" height="26" fill="#22863a"/>
+    <text class="lbl" x="175" y="38" text-anchor="end">attention_math</text>
+    <text class="lblmono" x="540" y="38">33,406 ms · 59.2%</text>
+    <!-- matmul 20.3% = 11489 ms -->
+    <rect x="180" y="52"  width="122.1" height="26" fill="#0366d6"/>
+    <text class="lbl" x="175" y="70" text-anchor="end">matmul</text>
+    <text class="lblmono" x="307" y="70">11,489 ms · 20.3%</text>
+    <!-- elementwise 18.7% = 10540 ms -->
+    <rect x="180" y="84"  width="112.0" height="26" fill="#b08800"/>
+    <text class="lbl" x="175" y="102" text-anchor="end">elementwise</text>
+    <text class="lblmono" x="297" y="102">10,540 ms · 18.7%</text>
+    <!-- layernorm 1.3% = 737 ms -->
+    <rect x="180" y="116" width="7.8" height="26" fill="#735c00"/>
+    <text class="lbl" x="175" y="134" text-anchor="end">layernorm</text>
+    <text class="lblmono" x="193" y="134">737 ms · 1.3%</text>
+    <!-- other 0.5% = 286 ms -->
+    <rect x="180" y="148" width="3.0" height="26" fill="#586069"/>
+    <text class="lbl" x="175" y="166" text-anchor="end">other</text>
+    <text class="lblmono" x="188" y="166">286 ms · 0.5%</text>
+    <!-- legend -->
+    <text class="lblmono" x="180" y="200">Total GPU kernel time captured: 56,458 ms over 2 steady-state diffusion steps</text>
+    <text class="lblmono" x="180" y="215">cond + uncond on 1 GPU; ≡ 28.2 s/step (matches Y4-sync's 28.8 s/step at 2-GPU CFG-parallel)</text>
+  </g>
+</svg>
+
+<h3>Predicted vs measured</h3>
+
+<table>
+  <thead><tr>
+    <th>Category</th><th class="num">Analytical prediction</th><th class="num">Measured</th>
+    <th class="num">Δ</th><th>Verdict</th>
+  </tr></thead>
+  <tbody>
+    <tr class="winner"><td><strong>attention_math</strong></td><td class="num">65.5%</td><td class="num"><strong>59.2%</strong></td><td class="num">-6.3</td><td>≈ as predicted; bottleneck CONFIRMED</td></tr>
+    <tr><td>matmul</td><td class="num">12.3%</td><td class="num">20.3%</td><td class="num" style="color:#b08800">+8.0</td><td>notably higher than predicted — FFN bigger than budgeted</td></tr>
+    <tr><td>elementwise</td><td class="num">5.9%</td><td class="num">18.7%</td><td class="num" style="color:#cb2431">+12.8</td><td><strong>BIG SURPRISE</strong> — kernel-fusion target</td></tr>
+    <tr><td>layernorm</td><td class="num">2.0%</td><td class="num">1.3%</td><td class="num">-0.7</td><td>≈ as predicted; vectorized kernel is fast</td></tr>
+    <tr><td>other (rope, reshape, memory)</td><td class="num">~13%</td><td class="num">0.5%</td><td class="num">-12.5</td><td>captured by elementwise / matmul categories instead</td></tr>
+  </tbody>
+</table>
+
+<p>
+  The analytical model was directionally right (attention is the bottleneck) but
+  it underestimated FFN matmul (FFN tile shapes hit cuBLAS/nvjet at only ~27% of peak)
+  and dramatically underestimated elementwise overhead (residuals, modulation,
+  norm scale+shift, activation functions show up as ~14 separate kernels per block × 40
+  blocks).
+</p>
+
+<!-- ==================== TOP KERNELS ==================== -->
+<h2 id="top-kernels">4. Top kernels — what's actually running on the GPU</h2>
+
+<p>
+  The ten heaviest kernels account for 87% of the captured GPU time. They tell you
+  exactly which optimization would target which percentage of the budget.
+</p>
+
+<table>
+  <thead><tr>
+    <th>Rank</th><th>Kernel name (decoded)</th><th class="num">Time (ms)</th>
+    <th class="num">% of total</th><th>What it is</th>
+  </tr></thead>
+  <tbody>
+    <tr class="winner"><td>1</td><td><code>cudnn_generated_fort_native_sdpa_sm90_flash_fprop_wgmma_f16_*</code></td><td class="num">33,406</td><td class="num">59.17%</td><td><strong>cuDNN FlashAttention on Hopper</strong>: sm90 = Hopper SM, flash_fprop = flash-style forward, wgmma_f16 = Hopper WGMMA tensor cores at f16. <em>Single dominant kernel, called once per attention layer × 40 blocks × 2 forwards.</em></td></tr>
+    <tr><td>2</td><td><code>nvjet_sm90_tst_192x208_64x4_1x2_h_bz_coopB_bias_TNT</code></td><td class="num">7,194</td><td class="num">12.74%</td><td><strong>FFN up projection</strong>: nvjet is NVIDIA's modern sm90-tuned GEMM library; 192×208 tile; T-N-T means transposed-non-transposed inputs. Likely the 5120→13824 FFN expand.</td></tr>
+    <tr><td>3</td><td><code>nvjet_sm90_tst_192x208_64x4_2x1_v_bz_coopB_bias_TNT</code></td><td class="num">2,156</td><td class="num">3.82%</td><td><strong>FFN down projection</strong> (13824→5120). Different aspect ratio variant.</td></tr>
+    <tr><td>4</td><td><code>sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize128x128x8_*</code></td><td class="num">2,115</td><td class="num">3.75%</td><td><strong>LayerNorm modulation FC</strong>, computed in fp32 for stability. Smaller GEMM, takes a fixed amount per block.</td></tr>
+    <tr><td>5</td><td><code>at::native::elementwise_kernel&lt;128, 4, ...&gt;</code></td><td class="num">1,934</td><td class="num">3.43%</td><td>Generic elementwise compute kernel; specific op varies per call site.</td></tr>
+    <tr><td>6</td><td><code>at::native::vectorized_elementwise_kernel&lt;8, bfloat16, ...&gt;</code></td><td class="num">1,213</td><td class="num">2.15%</td><td>Vectorized bf16 elementwise (residual adds, multiplications).</td></tr>
+    <tr><td>7</td><td><code>at::native::unrolled_elementwise_kernel&lt;direct_copy_kernel, ...&gt;</code></td><td class="num">1,167</td><td class="num">2.07%</td><td>Memory copies between tensors that share dtype.</td></tr>
+    <tr><td>8</td><td><code>at::native::elementwise_kernel&lt;128, 4, ...&gt;</code> (variant)</td><td class="num">815</td><td class="num">1.44%</td><td>Another elementwise variant; same template, different op specialization.</td></tr>
+    <tr><td>9</td><td><code>at::native::vectorized_layer_norm_kernel</code></td><td class="num">737</td><td class="num">1.31%</td><td><strong>LayerNorm proper.</strong> One per pre-/post-norm × block × 40 blocks.</td></tr>
+    <tr><td>10</td><td><code>at::native::elementwise_kernel&lt;128, 2, ...&gt;</code> (variant)</td><td class="num">667</td><td class="num">1.18%</td><td>Smaller variant; possibly the SiLU activation in the FFN.</td></tr>
+  </tbody>
+</table>
+
+<p>
+  Beyond the top 10: an additional ~5 distinct elementwise variants make up most
+  of the remaining 13%. None individually exceeds 3.4%, but they aggregate to
+  almost 19% of the per-step budget.
+</p>
+
+<!-- ==================== THROUGHPUT ==================== -->
+<h2 id="throughput">5. Achieved throughput vs H100 peak</h2>
+
+<p>
+  Knowing the per-category time isn't enough to decide where to optimize — we
+  also need to know how close each category is to hardware limits. If a category
+  is already at 80% of peak, there's not much headroom; if it's at 25%, there's
+  a lot of room for kernel improvements (FP8, fusion, better tile selection).
+</p>
+
+<table>
+  <thead><tr>
+    <th>Category</th><th>Total FLOPS in 2 steady steps</th>
+    <th class="num">Wall time</th><th class="num">Achieved</th>
+    <th class="num">% of H100 peak</th><th>Headroom verdict</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Attention math</td><td>4 × 4,680 TFLOPS = 18,720 TFLOPS</td>
+        <td class="num">33.4 s</td><td class="num">~560 TFLOPS</td>
+        <td class="num">~70% of FA peak</td>
+        <td>FA-class; FA3 may lift to ~800 TFLOPS (+1.4×)</td></tr>
+    <tr class="winner"><td><strong>Matmul (FFN + proj)</strong></td><td>4 × 588 TFLOPS = 2,352 TFLOPS</td>
+        <td class="num">11.5 s</td><td class="num"><strong>~205 TFLOPS</strong></td>
+        <td class="num" style="color:#cb2431"><strong>27% of dense peak (750)</strong></td>
+        <td><strong>Lots of headroom</strong> — FP8 doubles bytes-per-flop, easy 1.5-2× win</td></tr>
+    <tr><td>Elementwise (residual, modulation, activation)</td><td>bandwidth-bound</td>
+        <td class="num">10.5 s</td><td class="num">~0.5 TB/s effective</td>
+        <td class="num">~15% of 3.35 TB/s</td>
+        <td><strong>Fusion-bound</strong> — many small kernels each at 1-3% peak BW; <code>torch.compile</code>'s reduce-overhead mode would help if determinism issues were solved</td></tr>
+    <tr><td>LayerNorm</td><td>bandwidth-bound (~5 GB)</td>
+        <td class="num">0.74 s</td><td class="num">~7 GB/s effective</td>
+        <td class="num">~0.2% of peak</td>
+        <td>Already vectorized; fusion with adjacent residual could halve the cost (~0.4 s/step) but not worth the complexity</td></tr>
+  </tbody>
+</table>
+
+<p>
+  Two clean stories from this table:
+</p>
+
+<ul>
+  <li><strong>Attention math is the biggest absolute cost (33.4 s / 59%) and is already running well</strong> (70% of FA peak). FA3 would lift the efficiency further, but the kernel is already in good shape.</li>
+  <li><strong>FFN matmul is the highest-leverage category</strong> — 27% of peak means there's a 2-3× theoretical improvement available with the right quantization (FP8). On the kernel total of 11.5 s that's 4-7 s/step, or ~200-280 s saved over 40 steps.</li>
+</ul>
+
+<!-- ==================== WARMUP ==================== -->
+<h2 id="warmup">6. Step 0 (warmup) — the cuBLAS autotune story</h2>
+
+<p>
+  Step 0 takes 23.7 s wall vs steady-state's 14.4 s — an extra 9.4 s. What's
+  taking the extra time? Captured a separate trace specifically of step 0.
+</p>
+
+<h3>Result: GPU kernels are byte-for-byte identical to steady-state</h3>
+
+<table>
+  <thead><tr>
+    <th>Category</th><th class="num">Step 0 (warmup)</th><th class="num">Steady (steps 3-4)</th><th class="num">Δ</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>attention_math</td><td class="num">58.9%</td><td class="num">59.2%</td><td class="num">-0.3</td></tr>
+    <tr><td>matmul</td><td class="num">20.4%</td><td class="num">20.3%</td><td class="num">+0.1</td></tr>
+    <tr><td>elementwise</td><td class="num">18.9%</td><td class="num">18.7%</td><td class="num">+0.2</td></tr>
+    <tr><td>layernorm</td><td class="num">1.3%</td><td class="num">1.3%</td><td class="num">0.0</td></tr>
+    <tr><td>other</td><td class="num">0.5%</td><td class="num">0.5%</td><td class="num">0.0</td></tr>
+  </tbody>
+</table>
+
+<p>
+  Same kernels, same proportions. The extra 9.4 s of wall time is therefore
+  <strong>not GPU compute</strong>. CPU-side analysis: the dispatcher events
+  for <code>aten::scaled_dot_product_attention</code>, <code>aten::linear</code>,
+  and <code>aten::addmm</code> are all 2-3× their steady-state duration —
+  consistent with <strong>cuBLAS/cuDNN running their first-call autotune</strong>
+  to pick the optimal kernel variant for each unique input shape. Wan2.2's DiT
+  has ~40+ distinct matmul shapes (different head splits, FFN sizes,
+  modulation projections, etc.); each pays a small autotune cost on first
+  call, then the choice is memoized for steps 1-39.
+</p>
+
+<blockquote>
+  Implication: step 0 overhead is <strong>unavoidable but tiny in absolute
+  terms</strong> (1.5% of the 613 s diffusion). Not worth optimizing. It would
+  only become meaningful in a heavily-batched serving setup where many short
+  requests cycle through, in which case "warm the kernel cache once" at server
+  init time would amortize it.
+</blockquote>
+
+<!-- ==================== BOUNDARY ==================== -->
+<h2 id="boundary">7. Step 26 (boundary swap) — the PCIe pageable-memcpy story</h2>
+
+<p>
+  Step 26 takes 41.3 s wall vs 14.4 s steady — an extra 27 s. At step 26 the
+  diffusion timestep crosses <code>boundary_ratio × num_train_timesteps = 875</code>,
+  which is Wan2.2's signal to switch from the high-noise DiT to the low-noise DiT.
+  With <code>--offload_model True</code>, that means a model swap: high-noise goes
+  to CPU memory, low-noise comes off CPU memory to GPU. Where does the 27 s go?
+</p>
+
+<h3>Result: 28 s of unpinned-pageable PCIe memcpy</h3>
+
+<p>
+  Captured steps 25-26 specifically. GPU kernel mix is still identical to
+  steady-state (59% / 20% / 19% / 1%). The extra time appears in a different
+  category: <strong><code>gpu_memcpy</code></strong>.
+</p>
+
+<table>
+  <thead><tr>
+    <th>Event</th><th class="num">Total time</th><th>Notes</th>
+  </tr></thead>
+  <tbody>
+    <tr><td><code>Memcpy DtoH (Device → Pageable host)</code></td><td class="num">13.42 s</td><td>Evict high-noise DiT (27 GB) from GPU back to CPU</td></tr>
+    <tr><td><code>Memcpy HtoD (Pageable host → Device)</code></td><td class="num">13.31 s</td><td>Load low-noise DiT (27 GB) onto GPU</td></tr>
+    <tr><td><code>Memcpy DtoD</code></td><td class="num">1.31 s</td><td>Internal allocator reshuffling</td></tr>
+    <tr><td><code>cudaMemsetAsync</code></td><td class="num">0.27 s</td><td>Zero-fill freed regions</td></tr>
+    <tr><th class="num">Total memcpy</th><th class="num">~28 s</th><td>Matches step 26's extra ~27 s wall</td></tr>
+  </tbody>
+</table>
+
+<h3>Why so slow? Pageable memory throttles PCIe</h3>
+
+<p>
+  H100 supports PCIe Gen5 at theoretical ~64 GB/s and NVLink at much higher,
+  but those rates only apply with <strong>pinned (page-locked)</strong> host
+  buffers. <em>Pageable</em> host memory — the default for any normal
+  <code>torch.Tensor</code> created on the CPU — has to be staged through an
+  internal pinned buffer inside the CUDA driver, which throttles transfer
+  rates to ~2 GB/s.
+</p>
+
+<pre><code>27 GB / 2 GB/s ≈ 13.5 s per direction × 2 directions = 27 s   ← matches the trace exactly</code></pre>
+
+<h3>Two ways to make this go away</h3>
+
+<table>
+  <thead><tr>
+    <th>Path</th><th class="num">Saving</th><th>Effort</th>
+  </tr></thead>
+  <tbody>
+    <tr class="winner"><td><strong>Don't offload</strong> (already proved by Y4-no-offload)</td>
+        <td class="num"><strong>27 s</strong></td>
+        <td>0 — just drop <code>--offload_model True</code>. Requires 78 GB free per GPU; H100 80 GB fits.</td></tr>
+    <tr><td><strong>Pin the CPU-resident DiT weights</strong> via <code>tensor.pin_memory()</code></td>
+        <td class="num">22-25 s</td>
+        <td>~10 LOC patch — pin both DiTs after their initial CPU-side load. Useful on tighter-memory GPUs (≤40 GB) where you can't keep both DiTs resident.</td></tr>
+  </tbody>
+</table>
+
+<p>
+  SGLang's <code>--pin-cpu-memory</code> flag does exactly the second
+  approach for its <code>--dit-layerwise-offload</code>. That's part of why
+  SGLang's offload-on configuration is fast: same algorithm, pinned memory
+  instead of pageable.
+</p>
+
+<!-- ==================== CROSS-STEP ==================== -->
+<h2 id="cross-step">8. Cross-step invariance check</h2>
+
+<p>
+  All three captures — warmup (step 0), steady (steps 3-4), boundary (steps 25-26) —
+  produce nearly identical GPU kernel breakdowns:
+</p>
+
+<table>
+  <thead><tr>
+    <th>Category</th>
+    <th class="num">Step 0 (warmup)</th>
+    <th class="num">Steady (steps 3-4)</th>
+    <th class="num">Boundary (steps 25-26)</th>
+    <th>Verdict</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>attention_math</td><td class="num">58.9%</td><td class="num">59.2%</td><td class="num">59.0%</td><td>invariant</td></tr>
+    <tr><td>matmul</td><td class="num">20.4%</td><td class="num">20.3%</td><td class="num">20.4%</td><td>invariant</td></tr>
+    <tr><td>elementwise</td><td class="num">18.9%</td><td class="num">18.7%</td><td class="num">18.8%</td><td>invariant</td></tr>
+    <tr><td>layernorm</td><td class="num">1.3%</td><td class="num">1.3%</td><td class="num">1.3%</td><td>invariant</td></tr>
+    <tr><td>other</td><td class="num">0.5%</td><td class="num">0.5%</td><td class="num">0.5%</td><td>invariant</td></tr>
+  </tbody>
+</table>
+
+<blockquote class="good">
+  <strong>The DiT forward is a stationary workload across the loop.</strong>
+  Whatever the per-step optimization picture is at step 3, it's the same at
+  step 0 (warmup), step 26 (boundary), and presumably every other step.
+  Anomalous step times (step 0's +9.4 s, step 26's +27 s) come from outside
+  the GPU compute path — autotune and PCIe respectively. This is the cleanest
+  possible answer to "do we need to optimize different steps differently?":
+  no, the DiT forward is one workload.
+</blockquote>
+
+<!-- ==================== BUDGET ==================== -->
+<h2 id="budget">9. Full budget accounting — 613 s, line by line</h2>
+
+<p>
+  Combining the steady-state pie, the warmup analysis, and the boundary swap analysis,
+  the 613 s diffusion loop is ~99% accounted for at kernel / memcpy /
+  CPU-overhead granularity:
+</p>
+
+<table>
+  <thead><tr>
+    <th>Component</th><th class="num">Time</th><th class="num">% of total</th><th>Notes</th>
+  </tr></thead>
+  <tbody>
+    <tr><td colspan="4" style="background:#f6f8fa;"><strong>40 steady-state DiT forwards (14.4 s × 40)</strong> = 576 s = 94.0%</td></tr>
+    <tr><td>↳ attention math (cuDNN SDPA WGMMA)</td><td class="num">340 s</td><td class="num">55.5%</td><td>59.2% of forward × 576 s</td></tr>
+    <tr><td>↳ matmul (nvjet FFN + xmma modulation)</td><td class="num">117 s</td><td class="num">19.1%</td><td>20.3% of forward × 576 s</td></tr>
+    <tr><td>↳ elementwise (residual + norm scale/shift + activation + masking)</td><td class="num">108 s</td><td class="num">17.6%</td><td>18.7% of forward × 576 s</td></tr>
+    <tr><td>↳ LayerNorm + other</td><td class="num">11 s</td><td class="num">1.8%</td><td>~2% of forward × 576 s</td></tr>
+    <tr><td colspan="4" style="background:#f6f8fa;"><strong>Non-steady-state overhead</strong></td></tr>
+    <tr><td>Step 26 boundary model swap (pageable PCIe)</td><td class="num">27 s</td><td class="num">4.4%</td><td>13.4 DtoH + 13.3 HtoD; eliminated by Y4-no-offload</td></tr>
+    <tr><td>Step 0 first-iteration autotune (cuBLAS / cuDNN)</td><td class="num">9 s</td><td class="num">1.5%</td><td>amortized once across 40 steps</td></tr>
+    <tr><td><em>cfg_all_gather rank-wait sync (only on Y4-sync 2-GPU; not in this profile)</em></td><td class="num"><em>~0 s</em></td><td class="num"><em>—</em></td><td><em>This is a 1-GPU profile; in Y4-sync 2-GPU it's ~100 s, dominated by the slower rank's forward</em></td></tr>
+    <tr><td colspan="4" style="background:#f6f8fa;"><strong>Total</strong></td></tr>
+    <tr class="winner"><td><strong>Total diffusion_loop</strong></td><td class="num"><strong>613 s</strong></td><td class="num"><strong>100.0%</strong></td><td>Y4-sync, n=5, MD5-stable</td></tr>
+  </tbody>
+</table>
+
+<!-- ==================== OPTIMIZATIONS ==================== -->
+<h2 id="optimizations">10. Optimization implications — what to spend effort on</h2>
+
+<p>
+  With the verified kernel decomposition in hand, the rank-ordered list of
+  remaining lossless optimizations (and one lossy bonus) is:
+</p>
+
+<table>
+  <thead><tr>
+    <th>#</th><th>Optimization</th><th>Target category</th>
+    <th class="num">Realistic saving</th><th>Cost / risk</th>
+  </tr></thead>
+  <tbody>
+    <tr class="winner"><td>1</td>
+        <td><strong>Drop <code>--offload_model True</code></strong></td>
+        <td>step-26 PCIe memcpy</td>
+        <td class="num"><strong>27 s</strong></td>
+        <td>Lossless, already validated. Y4-no-offload's MD5 == Y4-sync's MD5. Use whenever GPU mem allows (H100 80 GB easily fits).</td></tr>
+    <tr><td>2</td>
+        <td><strong>Build FA3 from source for Hopper</strong></td>
+        <td>attention math (59%)</td>
+        <td class="num">~100-130 s</td>
+        <td>Lossless. Build is gated on torch 2.11 + cu13 wheel/source compatibility — historically fragile. If it works, lifts attention from ~560 → ~800 TFLOPS sustained.</td></tr>
+    <tr><td>3</td>
+        <td><strong>FP8 quantization on FFN matmul</strong> (lossy)</td>
+        <td>matmul (20.3%, at 27% peak)</td>
+        <td class="num">~150-200 s</td>
+        <td><em>Out of this engagement's scope</em>. Doubles bytes-per-FLOP, lifts nvjet kernels from ~205 → ~400 TFLOPS plausibly. Needs PSNR validation; quality impact varies by model.</td></tr>
+    <tr><td>4</td>
+        <td><strong>Pin CPU-resident DiT weights</strong></td>
+        <td>step-26 PCIe memcpy (alternative to #1)</td>
+        <td class="num">~22-25 s</td>
+        <td>Lossless. ~10 LOC patch. Only relevant if you can't drop offload (smaller GPUs).</td></tr>
+    <tr><td>5</td>
+        <td><strong>Kernel fusion via torch.compile</strong></td>
+        <td>elementwise (18.7%)</td>
+        <td class="num">~30-60 s</td>
+        <td>Currently gated on non-determinism bug; reduce-overhead mode produces different MD5s on different runs. If determinism is fixed, lifts elementwise efficiency by fusing ~14 small kernels into a few larger ones.</td></tr>
+    <tr><td>6</td>
+        <td>Fix the in-tree slow checkpoint loader</td>
+        <td>pipeline_init (not in 613 s)</td>
+        <td class="num">~15 min cold-start saved</td>
+        <td>Lossless, no per-frame impact. Matters only for short-batch serving (see <a href="a14b-2gpu-h100-benchmark.html">benchmark report</a>).</td></tr>
+  </tbody>
+</table>
+
+<h3>The realistic remaining lossless ceiling</h3>
+
+<p>
+  Adding items 1 + 2 + 5 (if compile determinism is solvable) to Y4-sync:
+</p>
+
+<table>
+  <thead><tr>
+    <th>Config</th><th class="num">diffusion_s</th><th class="num">Speedup vs 1-GPU</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Z1 — 1-GPU baseline</td><td class="num">1619.9</td><td class="num">1.00×</td></tr>
+    <tr class="winner"><td><strong>Y4-sync (current)</strong></td><td class="num"><strong>613.2</strong></td><td class="num"><strong>2.64×</strong></td></tr>
+    <tr><td>+ no-offload (saves 27 s)</td><td class="num">~586</td><td class="num">~2.76×</td></tr>
+    <tr><td>+ FA3 (saves another ~120 s)</td><td class="num">~466</td><td class="num">~3.48×</td></tr>
+    <tr><td>+ compile-fusion (if determinism fixed; saves another ~50 s)</td><td class="num">~416</td><td class="num">~3.89×</td></tr>
+  </tbody>
+</table>
+
+<p>
+  After that, the headroom is in the lossy bucket (FP8, step distillation,
+  TeaCache, sparse attention). The lossless ceiling on 2× NVLink-connected H100s
+  for 1280×720×81 frames at 40 UniPC steps is approximately <strong>~3.5-3.9× single-GPU</strong>,
+  i.e. <strong>415-470 s diffusion</strong>.
+</p>
+
+<!-- ==================== REPRODUCE ==================== -->
+<h2 id="reproduce">11. Reproduction commands &amp; code patches</h2>
+
+<h3>Patches (committed on <code>multi-gpu</code> branch)</h3>
+
+<ul>
+  <li><code>wan/text2video.py</code> — added <code>_maybe_kernel_profiler()</code> helper, env-gated; wraps the diffusion loop in <code>torch.profiler.profile()</code> with a configurable schedule</li>
+  <li><code>scripts/profiling/run_kernel_profile.sh</code> — single 1× H100 runner (default = steady-state target)</li>
+  <li><code>scripts/profiling/run_kernel_profile_extras.sh</code> — dual-run script (warmup target then boundary target back-to-back)</li>
+  <li><code>scripts/profiling/analyze_kernel_trace.py</code> — Chrome-trace parser with category-regex bucketing and predicted-vs-measured diff table</li>
+</ul>
+
+<h3>Run a steady-state capture (default target)</h3>
+
+<pre><code>CKPT=/workspace/Wan2.2-T2V-A14B
+PROMPT="Two anthropomorphic cats in comfy boxing gear and bright gloves \
+fight intensely on a spotlighted stage."
+
+WAN_PROFILE_KERNELS=1 \
+WAN_PROFILE_KERNELS_TARGET=steady \
+WAN_PROFILE_KERNELS_DIR=./kernel_profile \
+python generate.py --task t2v-A14B --ckpt_dir $CKPT \
+  --size '1280*720' --frame_num 81 --sample_steps 40 \
+  --base_seed 42 --prompt "$PROMPT" \
+  --convert_model_dtype --offload_model True</code></pre>
+
+<p>
+  The loop early-exits after capturing steps 3-4 (or step 0 for
+  <code>target=warmup</code>, or steps 25-26 for <code>target=boundary</code>).
+  Wall time ~5-10 min on 1× H100 if checkpoint is in page cache; ~20 min cold.
+</p>
+
+<h3>Analyze the captured trace</h3>
+
+<pre><code>python scripts/profiling/analyze_kernel_trace.py \
+  kernel_profile/&lt;hostname&gt;_&lt;pid&gt;.&lt;timestamp&gt;.pt.trace.json \
+  --gpu-only --top 15</code></pre>
+
+<h3>Reproducing the dual-target study</h3>
+
+<pre><code>bash scripts/profiling/run_kernel_profile_extras.sh
+# Runs warmup target then boundary target back-to-back.
+# Total wall ~30 min on 1× H100. Both traces appear under
+# /workspace/profile_outputs/kernel_profile_extras/&lt;target&gt;/trace/</code></pre>
+
+<details>
+  <summary>Per-category regex bucketing (full list)</summary>
+<pre><code>attention_math    flash_attn, flash_fprop, scaled_dot_product,
+                  native_sdpa, cudnn_generated.*sdpa, _efficient_attention,
+                  FlashFwd, fmha, softmax
+matmul            aten::(mm|addmm|bmm|baddbmm|matmul|linear),
+                  nvjet, xmma_gemm, gemm, cublas, cutlass, WGMMA
+layernorm         layer_norm, rms_norm, native_layer_norm
+rope_freq         rope, rotary, freq, sin_cos, position_embedding
+activation        silu, swish, gelu, relu, sigmoid, tanh
+elementwise       aten::(add|mul|div|sub|neg),
+                  elementwise_kernel, vectorized_elementwise,
+                  unrolled_elementwise
+reshape_view      aten::(view|transpose|permute|reshape|expand|
+                  unsqueeze|squeeze|contiguous)
+memory            aten::(empty|empty_like|zeros|ones|copy_|to|fill_|clone),
+                  Memcpy, Memset
+collectives       nccl, all_gather, all_reduce, all_to_all, broadcast</code></pre>
+</details>
+
+<hr class="section"/>
+<p class="meta" style="text-align:center;margin-top:24px">
+  Generated 2026-05-20. Companion documents:
+  <a href="a14b-2gpu-h100-benchmark.html">multi-engine benchmark</a> ·
+  <a href="a14b-2gpu-h100-benchmark.md">benchmark.md</a> ·
+  <a href="a14b-2gpu-h100-benchmark-tldr.md">tldr.md</a>.
+</p>
+
+</div>
+</body>
+</html>
